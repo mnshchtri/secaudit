@@ -69,6 +69,8 @@ secaudit --json findings.jsonl  # one JSON object per finding
 | `*`     | Select every fixable finding in the view         |
 | `x`     | Run the fix for the selection or current finding |
 | `a`     | Accept the risk (stops counting against score)   |
+| `i`     | Explain the finding with AI (Claude)             |
+| `I`     | AI action plan for the whole scan                |
 | `c`     | Copy the fix command or advice                   |
 | `/`     | Search findings                                  |
 | `1`–`5` | Issues / Accepted / Notes / Passed / All tabs    |
@@ -76,6 +78,26 @@ secaudit --json findings.jsonl  # one JSON object per finding
 | `o`     | Full text output of the scan                     |
 | `e`     | Export a Markdown checklist                      |
 | `?`     | All keys                                         |
+
+## AI explanations
+
+Press `i` on a finding and Claude explains it in plain terms: what it means, why it matters on a
+personal workstation, how to fix it step by step, trade-offs, and how to verify. Ask follow-up
+questions in the box at the bottom. `I` produces a prioritized action plan for every open issue.
+
+- **Opt-in.** Nothing is sent until you press `i` or `I` and agree once.
+- **What's sent:** the finding's section, message, details and suggested fix. Your username,
+  hostname and home path are replaced with `<user>`, `<host>` and `~` first. The scan never
+  collects secret values.
+- **Credentials:** `ANTHROPIC_API_KEY` (or an `ant auth login` profile), or paste a key in the app.
+  A pasted key is stored in `~/.config/secaudit/anthropic-api-key` with mode 600.
+- **Model:** `claude-opus-5-5` at `medium` effort by default; override with `SECAUDIT_AI_MODEL` and
+  `SECAUDIT_AI_EFFORT`. If the model declines a request, the API retries it on Anthropic's
+  recommended fallback model.
+- **Cost:** API usage is billed to your Anthropic account. First explanations are saved under
+  `~/.local/state/secaudit/ai-cache`, so reopening a finding is free; `ctrl+r` asks again.
+- AI-suggested commands can be copied but are never run by the app. Only secaudit's own fixes have
+  a Run button.
 
 ## Scoring
 
@@ -88,6 +110,7 @@ Everything lives under `${XDG_STATE_HOME:-~/.local/state}/secaudit`:
 
 - `runs/<timestamp>/`: `findings.jsonl`, `output.txt`, `meta.json`, `applied` (one folder per scan, newest 30 kept)
 - `accepted.json`: accepted risks, matched by section and message with numbers masked
+- `ai-cache/`: saved AI explanations
 
 ## JSON format
 

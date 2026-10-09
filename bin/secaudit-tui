@@ -1,13 +1,16 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["textual>=8,<9"]
+# dependencies = ["textual>=8,<9", "anthropic>=1,<2"]
 # ///
 """Security Audit: a terminal app for the secaudit engine.
 
 Runs scans with live progress, lets you browse and search findings, apply
 suggested fixes, compare against earlier scans and export reports.
 Scan data is shared with secaudit-ui under ~/.local/state/secaudit/runs.
+
+Press i on a finding to have Claude explain it and suggest a fix, or I for
+an action plan covering the whole scan (opt-in; needs an Anthropic API key).
 
 Usage: secaudit-tui [--scan quick|full|deep]
 """
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -29,6 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import anthropic
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult, SystemCommand
@@ -47,6 +52,7 @@ from textual.widgets import (
     ListItem,
     ListView,
     Log,
+    Markdown,
     OptionList,
     ProgressBar,
     RichLog,
@@ -790,6 +796,384 @@ class LogScreen(Screen[None]):
 
 
 # ---------------------------------------------------------------------------
+# AI assistant: Claude explains findings and suggests fixes. Opt-in: nothing
+# is sent until you press i and agree once. Usernames, the hostname and the
+# home path are replaced before a request leaves the machine.
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "secaudit"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+KEY_FILE = CONFIG_DIR / "anthropic-api-key"
+AI_CACHE = STATE / "ai-cache"
+AI_MODEL = os.environ.get("SECAUDIT_AI_MODEL", "claude-opus-5-5")
+AI_EFFORT = os.environ.get("SECAUDIT_AI_EFFORT", "medium")
+HOME = str(Path.home())
+
+AI_SYSTEM = """You are a security engineer helping the owner of a personal Linux workstation understand results from secaudit, a read-only audit tool. The machine runs Arch Linux with the Omarchy desktop (Hyprland on Wayland, systemd, pacman and the AUR, ufw firewall, LUKS disk encryption). The owner is a developer who also works in DevSecOps: be technically precise, but explain the underlying concepts plainly, as you would to a capable engineer who doesn't specialise in this particular area.
+
+Ground what you say in the findings you are given. Usernames, the hostname and the home directory are redacted as <user>, <host> and ~. Don't assume facts about the machine that the findings don't show; when the right action depends on something you can't see, say what to check and how.
+
+When you suggest commands:
+- Prefer the smallest change that resolves the issue, and say when a command needs sudo.
+- If secaudit's suggested fix is right, build on it. If it is risky, incomplete or wrong, say so directly and explain why.
+- Don't suggest switching off a security control just to clear a finding unless you label it clearly as a trade-off.
+- Include a direct way to confirm the fix worked.
+
+Write Markdown for a terminal: short paragraphs, ## headings, fenced code blocks for commands, no tables."""
+
+AI_EXPLAIN = """Explain this secaudit finding and how to deal with it.
+
+{finding}
+
+Use these sections:
+## What this means
+The issue in plain language, including the concept behind it (what the setting, permission, service or file does).
+## Why it matters
+A realistic way it could be abused on a personal workstation, and how serious it is here compared with a server. If the risk is low, say so plainly.
+## How to fix it
+Step by step, with commands and what each one does.
+## Trade-offs
+What could break or change for the owner, if anything.
+## Verify
+A direct check that the fix worked.
+
+Keep it under about 450 words."""
+
+AI_PLAN = """Here are the open issues from a secaudit scan of this workstation ({mode} scan, kernel {kernel}, score {score}/100).
+
+<open_issues>
+{issues}
+</open_issues>
+<accepted_risks>
+{accepted}
+</accepted_risks>
+
+Give the owner an action plan:
+## Overall picture
+Two or three sentences on the security posture in plain terms.
+## Do first
+The changes that reduce the most risk for the least effort, in order, with the commands to run.
+## Worth doing
+Lower-priority hardening, briefly.
+## Reasonable to accept
+Issues that are often fine on a personal dev workstation, and why, so the owner can decide to accept them.
+## Investigate
+Anything that could indicate compromise or misconfiguration and needs a closer look, with how to check. Say "nothing stands out" if that's the case.
+
+Keep it under about 650 words."""
+
+
+def redact(text: str) -> str:
+    text = re.sub(rf"{re.escape(HOME)}(?=/|$|[^\w.-])", "~", text)
+    for value, label in ((USER, "<user>"), (HOST, "<host>")):
+        if value:
+            text = re.sub(rf"(?<![\w.-]){re.escape(value)}(?![\w-])", label, text)
+    return text
+
+
+def finding_block(f: Finding, run: Run) -> str:
+    parts = [
+        "<finding>",
+        f"severity: {SEV.get(f.sev, SEV['info'])[1]}",
+        f"section: {f.section}",
+        f"message: {f.title}",
+    ]
+    if f.detail:
+        parts += ["details:", f.detail]
+    if f.fix:
+        parts.append(f"secaudit suggested fix: {f.fix}")
+    if f.hint:
+        parts.append(f"secaudit advice: {f.hint}")
+    parts.append("</finding>")
+    scope = "as the user; root-only checks were skipped" if run.mode == "quick" else "as root"
+    parts.append(f"<context>scan: {run.mode} ({scope}); kernel {run.meta.get('kernel', '?')}</context>")
+    return redact("\n".join(parts))
+
+
+def plan_prompt(run: Run) -> str:
+    def line(f: Finding) -> str:
+        extra = f" | fix: {f.fix}" if f.fix else (f" | advice: {f.hint}" if f.hint else "")
+        detail = f" | details: {' / '.join(f.detail.splitlines()[:6])}" if f.detail else ""
+        return f"- [{f.sev.upper()}] {f.section}: {f.title}{detail}{extra}"
+
+    issues = [f for f in run.findings if f.is_issue and not f.accepted]
+    accepted = [f for f in run.findings if f.accepted]
+    return redact(AI_PLAN.format(
+        mode=run.mode, kernel=run.meta.get("kernel", "?"), score=run.score,
+        issues="\n".join(line(f) for f in sorted(issues, key=lambda f: SEV_ORDER[f.sev])) or "none",
+        accepted="\n".join(f"- {f.section}: {f.title}" for f in accepted) or "none",
+    ))
+
+
+def load_config() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(data: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(data, indent=2))
+
+
+def stored_key() -> str | None:
+    try:
+        return KEY_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def store_key(key: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(key.strip() + "\n")
+    os.chmod(KEY_FILE, 0o600)
+
+
+def env_credentials() -> bool:
+    """Credentials the SDK finds on its own: env vars or an `ant auth login` profile."""
+    return bool(
+        os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        or (Path.home() / ".config/anthropic").is_dir()
+    )
+
+
+def ai_ready() -> bool:
+    return bool(load_config().get("ai_consent")) and (env_credentials() or bool(stored_key()))
+
+
+def ai_client() -> anthropic.AsyncAnthropic:
+    if env_credentials():
+        return anthropic.AsyncAnthropic()
+    return anthropic.AsyncAnthropic(api_key=stored_key())
+
+
+def cache_path(prompt: str) -> Path:
+    digest = hashlib.sha256(f"{AI_MODEL}\0{AI_SYSTEM}\0{prompt}".encode()).hexdigest()[:24]
+    return AI_CACHE / f"{digest}.md"
+
+
+class AISetupScreen(ModalScreen[bool]):
+    """One-time consent, plus an API key prompt when no credentials are found."""
+
+    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        need_key = not env_credentials() and not stored_key()
+        with Vertical(id="dialog"):
+            yield Static("Explain findings with Claude", classes="dialog-title")
+            yield Static(Text.assemble(
+                "When you ask, the finding (section, message, details and suggested fix) is sent to "
+                "Anthropic's API so Claude can explain it. Your username, hostname and home path are "
+                "replaced first, and the scan never collects secret values.\n\n",
+                ("Nothing is sent until you press i or I. ", PAL.muted),
+                (f"Model: {AI_MODEL}. API usage is billed to your Anthropic account.", PAL.muted),
+            ))
+            if need_key:
+                yield Static(Text.assemble(
+                    "\nPaste an API key from ", ("console.anthropic.com", f"bold {PAL.accent}"),
+                    " → API keys. It's saved to ", (str(KEY_FILE).replace(HOME, "~"), PAL.accent),
+                    " readable only by you. Setting ANTHROPIC_API_KEY instead also works.",
+                ))
+                yield Input(placeholder="sk-ant-…", password=True, id="ai-key")
+            yield Static("", id="ai-setup-error", classes="dialog-note")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancel", id="no")
+                yield Button("Enable", id="yes", variant="primary")
+
+    def on_mount(self) -> None:
+        inputs = self.query("#ai-key")
+        (inputs.first() if inputs else self.query_one("#yes")).focus()
+
+    @on(Input.Submitted, "#ai-key")
+    def submitted(self) -> None:
+        self.enable()
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "yes":
+            self.enable()
+        else:
+            self.dismiss(False)
+
+    def enable(self) -> None:
+        keys = self.query("#ai-key")
+        if keys:
+            key = keys.first(Input).value.strip()
+            if not key.startswith("sk-ant-"):
+                self.query_one("#ai-setup-error", Static).update(
+                    Text("That doesn't look like an Anthropic API key (they start with sk-ant-).", style=PAL.red)
+                )
+                return
+            store_key(key)
+        save_config(load_config() | {"ai_consent": True})
+        self.dismiss(True)
+
+
+class AIScreen(Screen[None]):
+    """Streams Claude's explanation, then takes follow-up questions."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("ctrl+r", "regenerate", "Regenerate"),
+        Binding("ctrl+o", "copy", "Copy answer"),
+    ]
+
+    def __init__(self, title: Text, prompt: str, subject: str):
+        super().__init__()
+        self.title_text = title
+        self.prompt = prompt
+        self.subject = subject
+        self.messages: list[dict] = []
+        self.last_answer = ""
+        self.busy = False
+
+    def compose(self) -> ComposeResult:
+        yield TopBar()
+        with Vertical(id="ai-box"):
+            yield Static(self.title_text, id="ai-title")
+            yield Static(Text(
+                "AI-generated. Review commands before running them; secaudit's own fixes are on the main screen.",
+                style=f"italic {PAL.muted}",
+            ), id="ai-note")
+            yield VerticalScroll(id="ai-scroll")
+            yield Static(id="ai-status")
+            yield Input(placeholder="Ask a follow-up, e.g. \"what breaks if I do this?\"  (enter to send)", id="ai-input")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(TopBar).right = f"AI · {self.subject} · {AI_MODEL}"
+        cached = cache_path(self.prompt)
+        if cached.is_file():
+            self.show_cached(cached.read_text())
+        else:
+            self.ask(self.prompt, show_question=False)
+
+    def show_cached(self, text: str) -> None:
+        self.messages = [{"role": "user", "content": self.prompt}, {"role": "assistant", "content": text}]
+        self.last_answer = text
+        self.query_one("#ai-scroll").mount(Markdown(text, classes="ai-answer"))
+        self.set_status(Text.assemble(("saved answer", PAL.muted), ("  ·  ctrl+r", f"bold {PAL.accent}"),
+                                      (" to ask again", PAL.muted)))
+        self.query_one("#ai-input").focus()
+
+    def set_status(self, text: Text | str) -> None:
+        self.query_one("#ai-status", Static).update(text)
+
+    @on(Input.Submitted, "#ai-input")
+    def follow_up(self, event: Input.Submitted) -> None:
+        question = event.value.strip()
+        if not question or self.busy:
+            return
+        event.input.value = ""
+        self.ask(question, show_question=True)
+
+    @work(exclusive=True, group="ai")
+    async def ask(self, question: str, show_question: bool) -> None:
+        self.busy = True
+        scroll = self.query_one("#ai-scroll", VerticalScroll)
+        box = self.query_one("#ai-input", Input)
+        box.disabled = True
+        if show_question:
+            await scroll.mount(Static(Text.assemble(("You  ", f"bold {PAL.accent}"), question), classes="ai-question"))
+        self.messages.append({"role": "user", "content": redact(question)})
+        answer = Markdown(classes="ai-answer")
+        await scroll.mount(answer)
+        scroll.scroll_end(animate=False)
+        # Created on the first chunk: stopping a MarkdownStream that never ran raises CancelledError
+        stream = None
+        started = time.time()
+        self.set_status(Text("Claude is thinking…", style=f"italic {PAL.muted}"))
+        text_parts: list[str] = []
+        try:
+            async with ai_client().beta.messages.stream(
+                model=AI_MODEL,
+                max_tokens=16000,
+                system=AI_SYSTEM,
+                messages=self.messages,
+                output_config={"effort": AI_EFFORT},
+                # On a safety decline, retry server-side on Anthropic's recommended fallback model
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+            ) as s:
+                async for chunk in s.text_stream:
+                    if stream is None:
+                        stream = Markdown.get_stream(answer)
+                        self.set_status(Text("Writing…", style=f"italic {PAL.muted}"))
+                    text_parts.append(chunk)
+                    await stream.write(chunk)
+                    if scroll.max_scroll_y - scroll.scroll_y < 4:
+                        scroll.scroll_end(animate=False)
+                final = await s.get_final_message()
+        except anthropic.AuthenticationError:
+            return self.ai_error("The API key was rejected. Remove it with: rm " + str(KEY_FILE).replace(HOME, "~"),
+                                 retry=False)
+        except anthropic.PermissionDeniedError:
+            return self.ai_error("This API key can't use this model. Set SECAUDIT_AI_MODEL to one it can use.", retry=False)
+        except anthropic.NotFoundError:
+            return self.ai_error(f"Model {AI_MODEL} wasn't found. Check SECAUDIT_AI_MODEL.", retry=False)
+        except anthropic.RateLimitError:
+            return self.ai_error("Rate limited by the API. Wait a moment.")
+        except anthropic.APIStatusError as e:
+            return self.ai_error(f"API error {e.status_code}: {e.message}")
+        except anthropic.APIConnectionError:
+            return self.ai_error("Couldn't reach the Anthropic API. Check your connection.")
+        except anthropic.AnthropicError as e:
+            return self.ai_error(str(e), retry=False)
+        finally:
+            if stream is not None:
+                await stream.stop()
+            else:
+                await answer.remove()  # nothing arrived; don't leave an empty answer box
+            self.busy = False
+            box.disabled = False
+            box.focus()
+
+        if final.stop_reason == "refusal":
+            self.messages.pop()
+            return self.ai_error("Claude declined to answer this one. Try rephrasing the question.")
+        # Keep the full content (thinking and fallback blocks included) so follow-ups continue the same turn history
+        self.messages.append({"role": "assistant", "content": final.content})
+        self.last_answer = "".join(text_parts)
+        if len(self.messages) == 2 and self.last_answer:
+            AI_CACHE.mkdir(parents=True, exist_ok=True)
+            cache_path(self.prompt).write_text(self.last_answer)
+        u = final.usage
+        note = Text(f"{time.time() - started:.0f}s · {u.input_tokens:,} in / {u.output_tokens:,} out tokens", style=PAL.muted)
+        if final.stop_reason == "max_tokens":
+            note.append("  ·  answer was cut off, ask it to continue", PAL.yellow)
+        if final.model != AI_MODEL:
+            note.append(f"  ·  answered by {final.model}", PAL.muted)
+        self.set_status(note)
+
+    def ai_error(self, message: str, retry: bool = True) -> None:
+        # Drop the unanswered question so a retry or follow-up starts from a valid history
+        if self.messages and self.messages[-1]["role"] == "user":
+            self.messages.pop()
+        hint = "  ·  ctrl+r to retry" if retry else ""
+        self.set_status(Text.assemble(("✗ ", f"bold {PAL.red}"), (message, PAL.red), (hint, PAL.muted)))
+
+    async def action_regenerate(self) -> None:
+        if self.busy:
+            return
+        cache_path(self.prompt).unlink(missing_ok=True)
+        self.messages = []
+        await self.query_one("#ai-scroll").remove_children()
+        self.ask(self.prompt, show_question=False)
+
+    def action_copy(self) -> None:
+        if self.last_answer:
+            copy_to_clipboard(self.app, self.last_answer)
+            self.notify("Answer copied")
+
+    def action_back(self) -> None:
+        self.workers.cancel_group(self, "ai")
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------------------
 # Main app
 
 
@@ -875,6 +1259,17 @@ class AuditApp(App[None]):
     #hist-table { height: 1fr; margin: 1 1 0 1; }
     #hist-diff { height: auto; max-height: 16; border-top: solid $panel; padding: 1 2; }
     #log { height: 1fr; margin: 0 1; }
+
+    #ai-box { height: 1fr; padding: 1 2 0 2; }
+    #ai-title { text-style: bold; }
+    #ai-note { margin-bottom: 1; }
+    #ai-scroll { height: 1fr; border: round $panel; padding: 0 1; }
+    .ai-question { margin: 1 0 1 0; }
+    .ai-answer { margin: 0; background: transparent; }
+    #ai-status { height: 1; margin: 0 1; }
+    #ai-input { margin-bottom: 1; }
+    AISetupScreen { align: center middle; background: $background 60%; }
+    #ai-key { margin-top: 1; }
     """
 
     BINDINGS = [
@@ -882,6 +1277,8 @@ class AuditApp(App[None]):
         Binding("x", "run_fix", "Fix"),
         Binding("space", "toggle_mark", "Select"),
         Binding("a", "accept", "Accept risk"),
+        Binding("i", "explain", "Explain (AI)"),
+        Binding("I", "ai_plan", "AI action plan", show=False),
         Binding("slash", "focus_search", "Search"),
         Binding("h", "history", "History"),
         Binding("r", "rescan", "Rescan", show=False),
@@ -901,7 +1298,7 @@ class AuditApp(App[None]):
 
     MAIN_ONLY = {
         "scan", "rescan", "run_fix", "copy", "focus_search", "history", "output", "export", "tab",
-        "clear_search", "toggle_mark", "mark_all", "accept",
+        "clear_search", "toggle_mark", "mark_all", "accept", "explain", "ai_plan",
     }
 
     def __init__(self, start_scan: str | None = None):
@@ -966,6 +1363,7 @@ class AuditApp(App[None]):
                             yield Button("Run fix  x", id="btn-runfix", variant="primary", compact=True)
                             yield Button("Copy  c", id="btn-copy", compact=True)
                             yield Button("Accept risk  a", id="btn-accept", compact=True)
+                            yield Button("Explain  i", id="btn-explain", compact=True)
                         yield Static("DETAILS", id="d-detail-cap", classes="caption")
                         yield Static(id="d-detail")
                         yield Static("SUGGESTED FIX", id="d-fix-cap", classes="caption")
@@ -1080,7 +1478,8 @@ class AuditApp(App[None]):
     def tips_text() -> Text:
         t = Text()
         for key, what in (("space", "select"), ("x", "fix selected"), ("*", "select all fixable"),
-                          ("a", "accept risk"), ("r", "rescan"), ("e", "export report")):
+                          ("a", "accept risk"), ("i", "explain with AI"), ("I", "AI action plan"),
+                          ("r", "rescan")):
             t.append(f"{key:>5} ", f"bold {PAL.accent}").append(f"{what}\n", PAL.muted)
         t.rstrip()
         return t
@@ -1266,8 +1665,9 @@ class AuditApp(App[None]):
         if f.hint:
             q("#d-hint-cap").display = q("#d-hint").display = True
             q("#d-hint", Static).update(Text(f.hint))
+        q("#d-actions").display = True
+        q("#btn-explain", Button).display = f.sev != "pass"
         if f.fix or f.hint or f.is_issue:
-            q("#d-actions").display = True
             q("#btn-runfix", Button).display = bool(f.fix) and not f.accepted
             q("#btn-copy", Button).display = bool(f.fix or f.hint)
             q("#btn-copy", Button).label = "Copy fix  c" if f.fix else "Copy advice  c"
@@ -1330,6 +1730,8 @@ class AuditApp(App[None]):
                 self.action_copy()
             case "btn-accept":
                 self.run_worker(self.action_accept())
+            case "btn-explain":
+                self.action_explain()
 
     # -- actions ---------------------------------------------------------
 
@@ -1342,6 +1744,10 @@ class AuditApp(App[None]):
             return True if self.marked or (self.selected and self.selected.fix and not self.selected.accepted) else None
         if action == "accept":
             return True if self.selected and self.selected.is_issue else None
+        if action == "explain":
+            return True if self.selected and self.selected.sev != "pass" else None
+        if action == "ai_plan":
+            return True if self.current else None
         if action in ("toggle_mark", "mark_all"):
             return True if self.current and self.tab != "accepted" else None
         if action == "copy":
@@ -1362,6 +1768,9 @@ class AuditApp(App[None]):
         if self.current:
             yield SystemCommand("Export Markdown report", "Checklist of issues with fixes", self.action_export)
             yield SystemCommand("Full output", "Raw text output of this scan", self.action_output)
+            yield SystemCommand("AI action plan", "Claude prioritizes every open issue in this scan", self.action_ai_plan)
+        if self.selected and self.selected.sev != "pass":
+            yield SystemCommand("Explain with AI", "Claude explains the selected finding and how to fix it", self.action_explain)
 
     def action_scan(self) -> None:
         self.push_screen(ScanChooser(), lambda mode: mode and self.start_scan(mode))
@@ -1529,6 +1938,29 @@ class AuditApp(App[None]):
             return
         copy_to_clipboard(self, text)
         self.notify("Fix command copied" if f.fix else "Advice copied")
+
+    def with_ai(self, then) -> None:
+        """Run `then` once AI is set up, showing the one-time consent/key dialog if needed."""
+        if ai_ready():
+            then()
+            return
+        self.push_screen(AISetupScreen(), lambda ok: ok and then())
+
+    def action_explain(self) -> None:
+        f, run = self.selected, self.current
+        if not f or not run or f.sev == "pass":
+            return
+        title = Text.assemble(sev_badge(f.sev), "  ", (f.title, "bold"), (f"   {f.section}", PAL.muted))
+        prompt = AI_EXPLAIN.format(finding=finding_block(f, run))
+        self.with_ai(lambda: self.push_screen(AIScreen(title, prompt, "explain")))
+
+    def action_ai_plan(self) -> None:
+        run = self.current
+        if not run:
+            return
+        n = run.counts["fail"] + run.counts["warn"]
+        title = Text.assemble(("Action plan  ", "bold"), (f"{n} open issue{'s' if n != 1 else ''} · score {run.score} {run.grade}", PAL.muted))
+        self.with_ai(lambda: self.push_screen(AIScreen(title, plan_prompt(run), "action plan")))
 
     def action_focus_search(self) -> None:
         self.query_one("#search", Input).focus()
