@@ -10,7 +10,8 @@ suggested fixes, compare against earlier scans and export reports.
 Scan data is shared with secaudit-ui under ~/.local/state/secaudit/runs.
 
 Press i on a finding to have Claude explain it and suggest a fix, or I for
-an action plan covering the whole scan (opt-in; needs an Anthropic API key).
+an action plan covering the whole scan (opt-in; uses Claude Code if it is
+installed, otherwise an Anthropic API key).
 
 Usage: secaudit-tui [--scan quick|full|deep]
 """
@@ -29,6 +30,7 @@ import socket
 import subprocess
 import time
 import tomllib
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -571,7 +573,8 @@ class ScanScreen(Screen[Path | None]):
         meta = {"mode": self.mode, "started": int(self.started), "host": HOST, "user": USER, "kernel": os.uname().release}
         (self.dir / "meta.json").write_text(json.dumps(meta))
 
-        cmd = [str(ENGINE), "--json", str(self.dir / "findings.jsonl")]
+        # Name the user explicitly so the scan checks this user's home even under sudo
+        cmd = [str(ENGINE), "--json", str(self.dir / "findings.jsonl"), "--user", USER]
         if self.mode == "deep":
             cmd.append("--deep")
         uses_sudo = self.mode != "quick"
@@ -804,7 +807,9 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 KEY_FILE = CONFIG_DIR / "anthropic-api-key"
 AI_CACHE = STATE / "ai-cache"
-AI_MODEL = os.environ.get("SECAUDIT_AI_MODEL", "claude-opus-5-5")
+MODEL_OVERRIDE = os.environ.get("SECAUDIT_AI_MODEL")
+AI_MODEL = MODEL_OVERRIDE or "claude-opus-5-5"
+CC_CWD = STATE / "claude-code"  # Claude Code files its sessions by working directory
 AI_EFFORT = os.environ.get("SECAUDIT_AI_EFFORT", "medium")
 HOME = str(Path.home())
 
@@ -940,8 +945,33 @@ def env_credentials() -> bool:
     )
 
 
+def claude_bin() -> str | None:
+    """The Claude Code CLI; launchers often run without the shell's PATH, so check the usual installs too."""
+    home = Path.home()
+    candidates = [
+        os.environ.get("SECAUDIT_CLAUDE_BIN"),
+        shutil.which("claude"),
+        str(home / ".local/bin/claude"),
+        str(home / ".claude/local/claude"),
+        *sorted((str(x) for x in (home / ".local/share/mise/installs/claude").glob("*/claude")), reverse=True),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def ai_backend() -> str:
+    """'claude-code' (your Claude Code sign-in) or 'api' (an Anthropic API key)."""
+    if load_config().get("ai_backend") == "api":
+        return "api"
+    return "claude-code" if claude_bin() else "api"
+
+
 def ai_ready() -> bool:
-    return bool(load_config().get("ai_consent")) and (env_credentials() or bool(stored_key()))
+    if not load_config().get("ai_consent"):
+        return False
+    return ai_backend() == "claude-code" or env_credentials() or bool(stored_key())
 
 
 def ai_client() -> anthropic.AsyncAnthropic:
@@ -956,32 +986,50 @@ def cache_path(prompt: str) -> Path:
 
 
 class AISetupScreen(ModalScreen[bool]):
-    """One-time consent, plus an API key prompt when no credentials are found."""
+    """One-time consent. Uses Claude Code when it's installed, otherwise asks for an API key."""
 
     BINDINGS = [Binding("escape", "dismiss(False)", "Cancel")]
 
+    def __init__(self):
+        super().__init__()
+        self.mode = "claude-code" if claude_bin() else "api"
+
     def compose(self) -> ComposeResult:
-        need_key = not env_credentials() and not stored_key()
         with Vertical(id="dialog"):
             yield Static("Explain findings with Claude", classes="dialog-title")
-            yield Static(Text.assemble(
-                "When you ask, the finding (section, message, details and suggested fix) is sent to "
-                "Anthropic's API so Claude can explain it. Your username, hostname and home path are "
-                "replaced first, and the scan never collects secret values.\n\n",
-                ("Nothing is sent until you press i or I. ", PAL.muted),
-                (f"Model: {AI_MODEL}. API usage is billed to your Anthropic account.", PAL.muted),
-            ))
-            if need_key:
+            if self.mode == "claude-code":
                 yield Static(Text.assemble(
-                    "\nPaste an API key from ", ("console.anthropic.com", f"bold {PAL.accent}"),
-                    " → API keys. It's saved to ", (str(KEY_FILE).replace(HOME, "~"), PAL.accent),
-                    " readable only by you. Setting ANTHROPIC_API_KEY instead also works.",
+                    "Explanations come from ", ("Claude Code", "bold"), " using your existing sign-in, so no API key "
+                    "is needed. It runs with every tool, MCP server and hook turned off, so it can only answer.\n\n",
+                    "When you ask, the finding (section, message, details and suggested fix) is sent to Claude. "
+                    "Your username, hostname and home path are replaced first, and the scan never collects secret values.\n\n",
+                    ("Nothing is sent until you press i or I. Usage counts toward your Claude plan.", PAL.muted),
                 ))
-                yield Input(placeholder="sk-ant-…", password=True, id="ai-key")
+            else:
+                yield Static(Text.assemble(
+                    "When you ask, the finding (section, message, details and suggested fix) is sent to "
+                    "Anthropic's API so Claude can explain it. Your username, hostname and home path are "
+                    "replaced first, and the scan never collects secret values.\n\n",
+                    ("Nothing is sent until you press i or I. ", PAL.muted),
+                    (f"Model: {AI_MODEL}. API usage is billed to your Anthropic account.", PAL.muted),
+                ))
+                if not env_credentials() and not stored_key():
+                    yield Static(Text.assemble(
+                        "\nPaste an API key from ", ("console.anthropic.com", f"bold {PAL.accent}"),
+                        " → API keys. It's saved to ", (str(KEY_FILE).replace(HOME, "~"), PAL.accent),
+                        " readable only by you. Setting ANTHROPIC_API_KEY instead also works.",
+                    ))
+                    yield Input(placeholder="sk-ant-…", password=True, id="ai-key")
             yield Static("", id="ai-setup-error", classes="dialog-note")
             with Horizontal(id="dialog-buttons"):
                 yield Button("Cancel", id="no")
-                yield Button("Enable", id="yes", variant="primary")
+                if self.mode == "claude-code":
+                    yield Button("Use an API key instead", id="use-api")
+                    yield Button("Use Claude Code", id="yes", variant="primary")
+                else:
+                    if claude_bin():
+                        yield Button("Use Claude Code instead", id="use-cc")
+                    yield Button("Enable", id="yes", variant="primary")
 
     def on_mount(self) -> None:
         inputs = self.query("#ai-key")
@@ -992,15 +1040,20 @@ class AISetupScreen(ModalScreen[bool]):
         self.enable()
 
     @on(Button.Pressed)
-    def pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "yes":
-            self.enable()
-        else:
-            self.dismiss(False)
+    async def pressed(self, event: Button.Pressed) -> None:
+        match event.button.id:
+            case "yes":
+                self.enable()
+            case "use-api" | "use-cc":
+                self.mode = "api" if event.button.id == "use-api" else "claude-code"
+                await self.recompose()
+                self.on_mount()
+            case _:
+                self.dismiss(False)
 
     def enable(self) -> None:
         keys = self.query("#ai-key")
-        if keys:
+        if self.mode == "api" and keys:
             key = keys.first(Input).value.strip()
             if not key.startswith("sk-ant-"):
                 self.query_one("#ai-setup-error", Static).update(
@@ -1008,7 +1061,7 @@ class AISetupScreen(ModalScreen[bool]):
                 )
                 return
             store_key(key)
-        save_config(load_config() | {"ai_consent": True})
+        save_config(load_config() | {"ai_consent": True, "ai_backend": self.mode})
         self.dismiss(True)
 
 
@@ -1029,6 +1082,9 @@ class AIScreen(Screen[None]):
         self.messages: list[dict] = []
         self.last_answer = ""
         self.busy = False
+        self.backend = ai_backend()
+        self.session_id: str | None = None  # Claude Code conversation, created on the first answer
+        self.proc: asyncio.subprocess.Process | None = None
 
     def compose(self) -> ComposeResult:
         yield TopBar()
@@ -1044,7 +1100,8 @@ class AIScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(TopBar).right = f"AI · {self.subject} · {AI_MODEL}"
+        via = "Claude Code" if self.backend == "claude-code" else AI_MODEL
+        self.query_one(TopBar).right = f"AI · {self.subject} · {via}"
         cached = cache_path(self.prompt)
         if cached.is_file():
             self.show_cached(cached.read_text())
@@ -1087,6 +1144,34 @@ class AIScreen(Screen[None]):
         started = time.time()
         self.set_status(Text("Claude is thinking…", style=f"italic {PAL.muted}"))
         text_parts: list[str] = []
+
+        async def emit(chunk: str) -> None:
+            nonlocal stream
+            if stream is None:
+                stream = Markdown.get_stream(answer)
+                self.set_status(Text("Writing…", style=f"italic {PAL.muted}"))
+            text_parts.append(chunk)
+            await stream.write(chunk)
+            if scroll.max_scroll_y - scroll.scroll_y < 4:
+                scroll.scroll_end(animate=False)
+
+        if self.backend == "claude-code":
+            try:
+                note = await self.ask_claude_code(question, emit)
+            finally:
+                if stream is not None:
+                    await stream.stop()
+                else:
+                    await answer.remove()
+                self.busy = False
+                box.disabled = False
+                box.focus()
+            if note is None:
+                return
+            self.messages.append({"role": "assistant", "content": "".join(text_parts)})
+            self.finish_answer("".join(text_parts), Text(f"{time.time() - started:.0f}s · {note}", style=PAL.muted))
+            return
+
         try:
             async with ai_client().beta.messages.stream(
                 model=AI_MODEL,
@@ -1099,13 +1184,7 @@ class AIScreen(Screen[None]):
                 fallbacks="default",
             ) as s:
                 async for chunk in s.text_stream:
-                    if stream is None:
-                        stream = Markdown.get_stream(answer)
-                        self.set_status(Text("Writing…", style=f"italic {PAL.muted}"))
-                    text_parts.append(chunk)
-                    await stream.write(chunk)
-                    if scroll.max_scroll_y - scroll.scroll_y < 4:
-                        scroll.scroll_end(animate=False)
+                    await emit(chunk)
                 final = await s.get_final_message()
         except anthropic.AuthenticationError:
             return self.ai_error("The API key was rejected. Remove it with: rm " + str(KEY_FILE).replace(HOME, "~"),
@@ -1136,22 +1215,99 @@ class AIScreen(Screen[None]):
             return self.ai_error("Claude declined to answer this one. Try rephrasing the question.")
         # Keep the full content (thinking and fallback blocks included) so follow-ups continue the same turn history
         self.messages.append({"role": "assistant", "content": final.content})
-        self.last_answer = "".join(text_parts)
-        if len(self.messages) == 2 and self.last_answer:
-            AI_CACHE.mkdir(parents=True, exist_ok=True)
-            cache_path(self.prompt).write_text(self.last_answer)
         u = final.usage
         note = Text(f"{time.time() - started:.0f}s · {u.input_tokens:,} in / {u.output_tokens:,} out tokens", style=PAL.muted)
         if final.stop_reason == "max_tokens":
             note.append("  ·  answer was cut off, ask it to continue", PAL.yellow)
         if final.model != AI_MODEL:
             note.append(f"  ·  answered by {final.model}", PAL.muted)
+        self.finish_answer("".join(text_parts), note)
+
+    def finish_answer(self, text: str, note: Text) -> None:
+        self.last_answer = text
+        if len(self.messages) == 2 and text:
+            AI_CACHE.mkdir(parents=True, exist_ok=True)
+            cache_path(self.prompt).write_text(text)
         self.set_status(note)
+
+    async def ask_claude_code(self, question: str, emit) -> str | None:
+        """Stream one turn from `claude -p`. Returns a status note, or None after showing an error."""
+        exe = claude_bin()
+        if not exe:
+            self.ai_error("Claude Code (the claude command) wasn't found. Set SECAUDIT_CLAUDE_BIN.", retry=False)
+            return None
+        prompt = redact(question)
+        if self.session_id is None and len(self.messages) > 1:
+            # The first answer came from the cache, so this conversation has no session yet; give it the context
+            prev = "\n\n".join(f"<{m['role']}>\n{m['content']}\n</{m['role']}>" for m in self.messages[:-1])
+            prompt = f"Earlier in this conversation:\n{prev}\n\nFollow-up question: {prompt}"
+        new_session = self.session_id is None
+        session = self.session_id or str(uuid.uuid4())
+        args = [
+            exe, "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+            # Answer only: no tools, MCP servers, slash commands or hooks
+            "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
+            "--settings", json.dumps({"disableAllHooks": True}),
+            "--system-prompt", AI_SYSTEM, "--effort", AI_EFFORT,
+            "--session-id" if new_session else "--resume", session,
+        ]
+        if MODEL_OVERRIDE:
+            args += ["--model", MODEL_OVERRIDE]
+        CC_CWD.mkdir(parents=True, exist_ok=True)
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *args, cwd=CC_CWD, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, limit=16 * 1024 * 1024,
+            )
+        except OSError as e:
+            self.ai_error(f"Couldn't start Claude Code: {e}", retry=False)
+            return None
+        assert self.proc.stdin and self.proc.stdout and self.proc.stderr
+        self.proc.stdin.write(prompt.encode())
+        await self.proc.stdin.drain()
+        self.proc.stdin.close()
+
+        result: dict = {}
+        model = ""
+        async for raw in self.proc.stdout:
+            try:
+                ev = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            kind = ev.get("type")
+            if kind == "stream_event":
+                e = ev.get("event", {})
+                d = e.get("delta", {})
+                if e.get("type") == "content_block_delta" and d.get("type") == "text_delta":
+                    await emit(d.get("text", ""))
+            elif kind == "system" and ev.get("subtype") == "init":
+                model = ev.get("model", "")
+            elif kind == "result":
+                result = ev
+        err = (await self.proc.stderr.read()).decode(errors="replace").strip()
+        rc = await self.proc.wait()
+        self.proc = None
+
+        if rc != 0 or not result or result.get("is_error"):
+            last_err = err.splitlines()[-1] if err else ""
+            msg = str(result.get("result") or last_err or f"exit status {rc}")
+            if "login" in msg.lower():
+                msg = "Claude Code isn't logged in. Run claude in a terminal and sign in, then try again."
+            self.ai_error(msg)
+            return None
+        if new_session:
+            self.session_id = session
+        out = (result.get("usage") or {}).get("output_tokens")
+        note = "Claude Code" + (f" ({model})" if model else "")
+        if out:
+            note += f" · {out:,} tokens"
+        return note
 
     def ai_error(self, message: str, retry: bool = True) -> None:
         # Drop the unanswered question so a retry or follow-up starts from a valid history
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages.pop()
+        self.busy = False
         hint = "  ·  ctrl+r to retry" if retry else ""
         self.set_status(Text.assemble(("✗ ", f"bold {PAL.red}"), (message, PAL.red), (hint, PAL.muted)))
 
@@ -1160,6 +1316,7 @@ class AIScreen(Screen[None]):
             return
         cache_path(self.prompt).unlink(missing_ok=True)
         self.messages = []
+        self.session_id = None
         await self.query_one("#ai-scroll").remove_children()
         self.ask(self.prompt, show_question=False)
 
@@ -1169,6 +1326,8 @@ class AIScreen(Screen[None]):
             self.notify("Answer copied")
 
     def action_back(self) -> None:
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
         self.workers.cancel_group(self, "ai")
         self.dismiss(None)
 
@@ -1208,7 +1367,7 @@ class AuditApp(App[None]):
     #body.narrow #sidebar { width: 26; }
     #body.narrow #search { width: 22; }
     #sections { background: transparent; height: 1fr; margin-top: 1; }
-    #tips { height: auto; color: $text-muted; border-top: solid $panel; padding: 1 1 0 1; }
+    #tips { height: auto; color: $text-muted; border-top: solid $panel; padding: 1 1 1 1; }
     #body.narrow #tips { display: none; }
     #sections > ListItem { padding: 0 1; }
     #sections Static { text-wrap: nowrap; text-overflow: ellipsis; }

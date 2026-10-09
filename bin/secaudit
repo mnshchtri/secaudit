@@ -11,6 +11,7 @@ export LC_ALL=C
 deep=""
 report=""
 json=""
+user_override=""
 color=1
 
 usage() {
@@ -21,6 +22,7 @@ Usage: secaudit [options]
                   (slow, several minutes)
   --report FILE   Write a plain-text copy of the output to FILE
   --json FILE     Write findings as JSON lines to FILE (used by secaudit-ui)
+  --user NAME     Audit NAME's home folder (default: the user who ran sudo)
   --no-color      Disable colored output
   -h, --help      Show this help
 
@@ -33,6 +35,7 @@ while (($#)); do
     --deep) deep=1 ;;
     --report) report="$2"; shift ;;
     --json) json="$2"; shift ;;
+    --user) user_override="$2"; shift ;;
     --no-color) color="" ;;
     -h | --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -61,8 +64,9 @@ else
 fi
 
 # Audit the invoking user's home even under sudo
-target_user="${SUDO_USER:-$USER}"
+target_user="${user_override:-${SUDO_USER:-$USER}}"
 target_home=$(getent passwd "$target_user" | cut -d: -f6)
+[[ -n "$target_home" ]] || { echo "Unknown user: $target_user" >&2; exit 2; }
 is_root=$((EUID == 0))
 
 pass=0 warn=0 fail=0 skip=0
@@ -196,12 +200,18 @@ else
 fi
 
 if have bootctl; then
+  # bootctl prints e.g. "disabled (unknown)" or "enabled (user)": state, then firmware mode
   sb=$(bootctl status 2>/dev/null | awk -F': ' '/Secure Boot/{print $2; exit}')
+  sb_mode=$(sed -n 's/.*(\(.*\)).*/\1/p' <<<"$sb")
   case "$sb" in
-    *enabled*) ok "Secure Boot: $sb" ;;
+    enabled*) ok "Secure Boot is enabled${sb_mode:+ ($sb_mode mode)}" ;;
     "") skp "Secure Boot state unknown" ;;
     *)
-      wn "Secure Boot: $sb (evil-maid/bootkit protection is weaker)"
+      if [[ "$sb_mode" == setup ]]; then
+        wn "Secure Boot is off; firmware is in Setup Mode, ready for your own keys"
+      else
+        wn "Secure Boot is off, so a tampered bootloader or kernel would still boot"
+      fi
       hint "Enroll your own keys with sbctl and sign Limine: wiki.archlinux.org/title/Secure_Boot#sbctl"
       ;;
   esac

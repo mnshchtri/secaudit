@@ -53,6 +53,7 @@ secaudit-tui --scan full      # start a scan right away
 secaudit                      # quick pass as your user
 sudo secaudit                 # full coverage (shadow, sudoers, firewall rules, LUKS headers)
 sudo secaudit --deep          # + package file checksums and a whole-disk SUID scan (slow)
+sudo secaudit --user alice    # audit alice's home folder (default: whoever ran sudo)
 secaudit --report audit.txt   # also write a plain-text copy
 secaudit --json findings.jsonl  # one JSON object per finding
 ```
@@ -89,13 +90,21 @@ questions in the box at the bottom. `I` produces a prioritized action plan for e
 - **What's sent:** the finding's section, message, details and suggested fix. Your username,
   hostname and home path are replaced with `<user>`, `<host>` and `~` first. The scan never
   collects secret values.
-- **Credentials:** `ANTHROPIC_API_KEY` (or an `ant auth login` profile), or paste a key in the app.
-  A pasted key is stored in `~/.config/secaudit/anthropic-api-key` with mode 600.
-- **Model:** `claude-opus-5-5` at `medium` effort by default; override with `SECAUDIT_AI_MODEL` and
-  `SECAUDIT_AI_EFFORT`. If the model declines a request, the API retries it on Anthropic's
-  recommended fallback model.
-- **Cost:** API usage is billed to your Anthropic account. First explanations are saved under
-  `~/.local/state/secaudit/ai-cache`, so reopening a finding is free; `ctrl+r` asks again.
+- **Claude Code (default when installed):** uses your existing Claude Code sign-in, so no API key
+  is needed and usage counts toward your Claude plan. It runs `claude -p` with every tool, MCP
+  server, slash command and hook turned off, so it can only answer. Follow-up questions continue
+  the same Claude Code session. If `claude` isn't on the launcher's `PATH`, set
+  `SECAUDIT_CLAUDE_BIN`.
+- **API key (alternative):** choose "Use an API key instead" in the setup dialog. Uses
+  `ANTHROPIC_API_KEY` (or an `ant auth login` profile), or a key pasted in the app, stored in
+  `~/.config/secaudit/anthropic-api-key` with mode 600. API usage is billed to your Anthropic
+  account; if the model declines a request, the API retries it on Anthropic's recommended
+  fallback model.
+- **Model:** Claude Code's default model, or `claude-opus-5-5` with an API key, at `medium` effort.
+  Override with `SECAUDIT_AI_MODEL` and `SECAUDIT_AI_EFFORT`. To switch backends later, edit
+  `ai_backend` (`claude-code` or `api`) in `~/.config/secaudit/config.json`.
+- **Saved answers:** first explanations are saved under `~/.local/state/secaudit/ai-cache`, so
+  reopening a finding costs nothing; `ctrl+r` asks again.
 - AI-suggested commands can be copied but are never run by the app. Only secaudit's own fixes have
   a Run button.
 
