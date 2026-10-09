@@ -568,14 +568,17 @@ class ScanScreen(Screen[Path | None]):
         cmd = [str(ENGINE), "--json", str(self.dir / "findings.jsonl")]
         if self.mode == "deep":
             cmd.append("--deep")
-        if self.mode != "quick":
+        uses_sudo = self.mode != "quick"
+        if uses_sudo:
             cmd = ["sudo", "-n", *cmd]  # credentials were cached before this screen opened
 
         with open(self.dir / "output.txt", "w") as out:
             try:
                 self.proc = await asyncio.create_subprocess_exec(
                     *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT, start_new_session=True,
+                    # sudo caches the password per terminal session, so a sudo scan must
+                    # stay in ours; a quick scan gets its own session so cancel can stop its tree
+                    stderr=asyncio.subprocess.STDOUT, start_new_session=not uses_sudo,
                 )
             except OSError as e:
                 return self.fail(str(e))
@@ -593,7 +596,11 @@ class ScanScreen(Screen[Path | None]):
         if not findings.is_file() or not findings.stat().st_size:
             tail = (self.dir / "output.txt").read_text().strip().splitlines()[-3:]
             shutil.rmtree(self.dir, ignore_errors=True)
-            return self.fail("\n".join(tail) or f"exit status {self.proc.returncode}")
+            reason = "\n".join(tail) or f"exit status {self.proc.returncode}"
+            if "password is required" in reason:
+                reason += ("\nsudo did not keep your password for this terminal. Press escape and start "
+                           "the scan again; if it keeps happening, run 'sudo -v' in this terminal first.")
+            return self.fail(reason)
 
         meta["finished"] = int(time.time())
         (self.dir / "meta.json").write_text(json.dumps(meta))
@@ -618,9 +625,10 @@ class ScanScreen(Screen[Path | None]):
         if self.proc and self.proc.returncode is None:
             self.cancelled = True
             try:
-                # Our own session: signal the whole tree. Under sudo we can only reach
-                # sudo itself, which relays the signal to the engine.
-                os.killpg(self.proc.pid, signal.SIGTERM)
+                if self.mode == "quick":
+                    os.killpg(self.proc.pid, signal.SIGTERM)  # own session: stop the whole tree
+                else:
+                    self.proc.terminate()  # sudo relays the signal to the root-owned engine
             except (ProcessLookupError, PermissionError):
                 self.proc.terminate()
         if self.cancelled and self.dir:
