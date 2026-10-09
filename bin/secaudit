@@ -1,0 +1,699 @@
+#!/bin/bash
+# Read-only security audit for this Omarchy (Arch) machine.
+# Usage: secaudit [--deep] [--report FILE] [--json FILE] [--no-color] [--help]
+# Interactive front-end: secaudit-ui
+# Run as a normal user for a quick pass, or with sudo for full coverage
+# (shadow, sudoers, root-owned configs, other users' files).
+
+set -o pipefail
+export LC_ALL=C
+
+deep=""
+report=""
+json=""
+color=1
+
+usage() {
+  cat <<EOF
+Usage: secaudit [options]
+
+  --deep          Also verify every package file checksum and scan / for SUID/SGID
+                  (slow, several minutes)
+  --report FILE   Write a plain-text copy of the output to FILE
+  --json FILE     Write findings as JSON lines to FILE (used by secaudit-ui)
+  --no-color      Disable colored output
+  -h, --help      Show this help
+
+Run with sudo for full coverage. The script never modifies the system.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --deep) deep=1 ;;
+    --report) report="$2"; shift ;;
+    --json) json="$2"; shift ;;
+    --no-color) color="" ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ -n "$report" ]]; then
+  # Pre-create so a report written under sudo stays owned by the invoking user
+  mkdir -p "$(dirname "$report")" && : >"$report" || exit 1
+  [[ -n "$SUDO_USER" ]] && chown "$SUDO_USER:" "$report" "$(dirname "$report")"
+  exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' > "$report")) 2>&1
+fi
+
+if [[ -n "$json" ]]; then
+  command -v jq >/dev/null || { echo "--json needs jq" >&2; exit 2; }
+  mkdir -p "$(dirname "$json")" && : >"$json" || exit 1
+  [[ -n "$SUDO_USER" ]] && chown "$SUDO_USER:" "$json"
+fi
+
+[[ -t 1 && -n "$color" ]] || color=""
+if [[ -n "$color" ]]; then
+  R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[34m' D=$'\e[2m' BOLD=$'\e[1m' N=$'\e[0m'
+else
+  R="" G="" Y="" B="" D="" BOLD="" N=""
+fi
+
+# Audit the invoking user's home even under sudo
+target_user="${SUDO_USER:-$USER}"
+target_home=$(getent passwd "$target_user" | cut -d: -f6)
+is_root=$((EUID == 0))
+
+pass=0 warn=0 fail=0 skip=0
+
+# Run the last command of a pipeline in this shell so `cmd | detail` can attach to the finding
+shopt -s lastpipe
+
+# Each finding is buffered until the next one starts, so detail/fix/hint can attach to it
+cur_sev="" cur_sec="" cur_msg="" cur_detail="" cur_fix="" cur_hint=""
+flush() {
+  [[ -n "$json" && -n "$cur_sev" ]] &&
+    jq -nc --arg sev "$cur_sev" --arg section "$cur_sec" --arg msg "$cur_msg" \
+      --arg detail "$cur_detail" --arg fix "$cur_fix" --arg hint "$cur_hint" \
+      '{$sev, $section, $msg, $detail, $fix, $hint}' >>"$json"
+  cur_sev="" cur_detail="" cur_fix="" cur_hint=""
+}
+finding() { flush; cur_sev=$1; cur_msg=$2; }
+
+section() { flush; cur_sec="$*"; printf '\n%s== %s ==%s\n' "$BOLD$B" "$*" "$N"; }
+ok()      { finding pass "$*"; printf '  %s[PASS]%s %s\n' "$G" "$N" "$*"; ((pass++)); }
+wn()      { finding warn "$*"; printf '  %s[WARN]%s %s\n' "$Y" "$N" "$*"; ((warn++)); }
+bad()     { finding fail "$*"; printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; ((fail++)); }
+info()    { finding info "$*"; printf '  %s[INFO]%s %s\n' "$B" "$N" "$*"; }
+skp()     { finding skip "$*"; printf '  %s[SKIP]%s %s\n' "$D" "$N" "$*"; ((skip++)); }
+detail()  {
+  local t; t=$(cat)
+  [[ -z "$t" ]] && return 0
+  sed 's/^/         /' <<<"$t"
+  cur_detail+="${cur_detail:+$'\n'}$t"
+}
+# fix: a shell command that remediates the current finding; hint: prose advice
+fix()     { cur_fix="$*"; printf '         %s> fix: %s%s\n' "$D" "$*" "$N"; }
+hint()    { cur_hint="$*"; printf '         %s> %s%s\n' "$D" "$*" "$N"; }
+q()       { printf '%q' "$1"; }
+have()    { command -v "$1" >/dev/null 2>&1; }
+need_root() { ((is_root)) || { skp "$* (needs sudo)"; return 1; }; }
+
+printf '%sSecurity audit%s  host=%s  user=%s  root=%s  %s\n' \
+  "$BOLD" "$N" "$(hostname)" "$target_user" "$( ((is_root)) && echo yes || echo no)" "$(date -Is)"
+printf '%sKernel %s | %s%s\n' "$D" "$(uname -r)" "$(. /etc/os-release && echo "$PRETTY_NAME")" "$N"
+
+# ---------------------------------------------------------------------------
+section "Packages & updates"
+
+if have checkupdates; then
+  updates=$(checkupdates 2>/dev/null)
+  n=$(grep -c . <<<"$updates")
+  if ((n == 0)); then ok "No pending repo updates"
+  else
+    wn "$n pending repo updates"
+    fix "omarchy-update"
+    grep -Ei '^(linux|openssl|openssh|glibc|sudo|systemd|curl|gnutls|nss|firefox|chromium|brave)' <<<"$updates" | detail
+  fi
+else
+  skp "checkupdates missing (pacman-contrib)"
+fi
+
+if have arch-audit; then
+  vulns=$(arch-audit -u 2>/dev/null)
+  if [[ -z "$vulns" ]]; then ok "arch-audit: no known-vulnerable packages with fixes available"
+  else bad "arch-audit: vulnerable packages with fixes available"; detail <<<"$vulns"; fix "omarchy-update"; fi
+else
+  info "arch-audit not installed (no CVE matching of installed packages)"
+  fix "sudo pacman -S --needed arch-audit"
+fi
+
+running=$(uname -r)
+if [[ -d /usr/lib/modules/$running ]]; then
+  ok "Running kernel modules present (no pending reboot for kernel)"
+else
+  wn "Running kernel $running has no modules dir: kernel was upgraded, reboot needed"
+  fix "systemctl reboot"
+fi
+
+orphans=$(pacman -Qdtq 2>/dev/null)
+[[ -n "$orphans" ]] && info "$(wc -l <<<"$orphans") orphaned packages (pacman -Qdtq)"
+foreign=$(pacman -Qmq 2>/dev/null)
+[[ -n "$foreign" ]] && info "$(wc -l <<<"$foreign") foreign/AUR packages, not covered by repo signing: $(paste -sd' ' <<<"$foreign" | cut -c1-200)"
+
+if grep -Eq '^\s*SigLevel\s*=.*(Never|Optional TrustAll)' /etc/pacman.conf; then
+  bad "pacman.conf has a weak SigLevel"; grep -En '^\s*SigLevel' /etc/pacman.conf | detail
+  hint "Set 'SigLevel = Required DatabaseOptional' in /etc/pacman.conf"
+else
+  ok "pacman signature checking is enforced"
+fi
+
+hooks=$(ls /etc/pacman.d/hooks/*.hook 2>/dev/null)
+if [[ -n "$hooks" ]]; then
+  info "Custom pacman hooks (run as root on transactions):"
+  for h in $hooks; do
+    exe=$(grep -m1 '^Exec' "$h" | cut -d= -f2- | xargs)
+    printf '%s -> %s\n' "${h##*/}" "$exe" | detail
+    bin=${exe%% *}
+    [[ -f "$bin" ]] && grep -Eq 'curl|wget' "$bin" && grep -Eq '\|\s*(ba)?sh' "$bin" &&
+      { wn "${h##*/}: $bin pipes a remote download into a shell as root"
+        hint "Download the script once, review it, and run the local copy from the hook"; }
+  done
+fi
+
+if [[ -n "$deep" ]]; then
+  if need_root "Package file integrity (pacman -Qkk)"; then
+    info "Verifying package file checksums (slow)..."
+    changed=$(pacman -Qkk 2>/dev/null | grep -vE ' 0 altered files|backup file' | grep -E 'warning|altered' |
+      grep -vE '\(Modification time mismatch\)|\(Permissions mismatch\)' | head -40)
+    if [[ -z "$changed" ]]; then ok "No altered package files outside backup/config files"
+    else
+      wn "Package files differ from their package checksums (review):"; detail <<<"$changed"
+      hint "Reinstall a package to restore its files: sudo pacman -S <package> (find it with pacman -Qo <file>)"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section "Boot & disk"
+
+if lsblk -no FSTYPE | grep -q crypto_LUKS; then
+  ok "LUKS full-disk encryption in use"
+  if ((is_root)) && have cryptsetup; then
+    for dev in $(lsblk -lnpo NAME,FSTYPE | awk '$2=="crypto_LUKS"{print $1}'); do
+      hdr=$(cryptsetup luksDump "$dev" 2>/dev/null)
+      ver=$(awk '/^Version:/{print $2}' <<<"$hdr")
+      [[ "$ver" == 2 ]] && ok "$dev is LUKS2" ||
+        { wn "$dev is LUKS$ver (LUKS2 recommended)"; hint "Back up the header, then from a live USB: cryptsetup convert --type luks2 $dev"; }
+      grep -q 'PBKDF:\s*argon2id' <<<"$hdr" && ok "$dev uses argon2id" ||
+        { wn "$dev keyslot not using argon2id"; fix "sudo cryptsetup luksConvertKey --pbkdf argon2id $(q "$dev")"; }
+    done
+  fi
+else
+  bad "No LUKS encrypted volumes found"
+  hint "Disk encryption needs a reinstall; Omarchy's installer sets up LUKS by default"
+fi
+
+if have bootctl; then
+  sb=$(bootctl status 2>/dev/null | awk -F': ' '/Secure Boot/{print $2; exit}')
+  case "$sb" in
+    *enabled*) ok "Secure Boot: $sb" ;;
+    "") skp "Secure Boot state unknown" ;;
+    *)
+      wn "Secure Boot: $sb (evil-maid/bootkit protection is weaker)"
+      hint "Enroll your own keys with sbctl and sign Limine: wiki.archlinux.org/title/Secure_Boot#sbctl"
+      ;;
+  esac
+fi
+
+for f in /boot/limine.conf /boot/EFI/limine/limine.conf /boot/limine/limine.conf; do
+  [[ -f "$f" ]] || continue
+  perm=$(stat -c '%a' "$f")
+  [[ "$perm" =~ [2367]$ ]] && { bad "$f is world-writable ($perm)"; fix "sudo chmod 600 $(q "$f")"; } || ok "$f perms $perm"
+done
+
+swaps=$(swapon --show=NAME,TYPE --noheadings 2>/dev/null)
+while read -r name type; do
+  [[ -z "$name" ]] && continue
+  if [[ "$name" == /dev/zram* ]]; then ok "Swap $name is zram (RAM-backed)"
+  elif [[ "$type" == file ]]; then ok "Swap file $name lives on the encrypted root"
+  else info "Swap $name ($type): confirm it is on an encrypted device"; fi
+done <<<"$swaps"
+
+# ---------------------------------------------------------------------------
+section "Kernel hardening (sysctl)"
+
+check_sysctl() { # key expected severity note
+  local v want=${2##* }
+  v=$(sysctl -n "$1" 2>/dev/null) || { skp "$1 not available"; return; }
+  [[ " $2 " == *" $v "* ]] && { ok "$1 = $v"; return; }
+  if [[ "$3" == fail ]]; then bad "$1 = $v (want ${2// / or })${4:+ $4}"
+  else wn "$1 = $v (want ${2// / or })${4:+ $4}"; fi
+  fix "echo '$1=$want' | sudo tee -a /etc/sysctl.d/99-zz-hardening.conf && sudo sysctl -w '$1=$want'"
+}
+check_sysctl kernel.randomize_va_space 2 fail
+check_sysctl kernel.kptr_restrict "1 2" warn
+check_sysctl kernel.dmesg_restrict 1 warn
+check_sysctl kernel.yama.ptrace_scope "1 2 3" warn "(any process can ptrace your other processes)"
+check_sysctl kernel.unprivileged_bpf_disabled "1 2" warn
+check_sysctl kernel.kexec_load_disabled 1 warn
+check_sysctl kernel.sysrq "0 16 176" warn
+check_sysctl fs.protected_symlinks 1 fail
+check_sysctl fs.protected_hardlinks 1 fail
+check_sysctl fs.protected_fifos "1 2" warn
+check_sysctl fs.protected_regular "1 2" warn
+check_sysctl fs.suid_dumpable 0 warn
+check_sysctl net.ipv4.tcp_syncookies 1 warn
+check_sysctl net.ipv4.conf.all.accept_redirects 0 warn
+check_sysctl net.ipv6.conf.all.accept_redirects 0 warn
+check_sysctl net.ipv4.conf.all.send_redirects 0 warn
+check_sysctl net.ipv4.conf.all.accept_source_route 0 warn
+check_sysctl net.ipv4.conf.all.rp_filter "1 2" warn
+check_sysctl net.ipv4.conf.all.log_martians 1 warn
+fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+[[ "$fwd" == 1 ]] && info "net.ipv4.ip_forward = 1 (expected with Docker/libvirt; relies on firewall FORWARD rules)"
+
+taint=$(cat /proc/sys/kernel/tainted)
+if ((taint == 0)); then ok "Kernel not tainted"
+else
+  flags=""
+  ((taint & 1)) && flags+="proprietary-module "
+  ((taint & 4096)) && flags+="out-of-tree-module "
+  ((taint & 8192)) && flags+="unsigned-module "
+  ((taint & 128)) && flags+="kernel-oops "
+  info "Kernel tainted ($taint): ${flags:-see docs.kernel.org/admin-guide/tainted-kernels}"
+fi
+
+lsm=$(cat /sys/kernel/security/lsm 2>/dev/null)
+[[ -n "$lsm" ]] && info "Active LSMs: $lsm"
+grep -qE 'apparmor|selinux' <<<"$lsm" || info "No MAC (AppArmor/SELinux) enforcing"
+
+if [[ -f /etc/ld.so.preload ]] && grep -q . /etc/ld.so.preload; then
+  bad "/etc/ld.so.preload is set (common rootkit vector):"; detail </etc/ld.so.preload
+  hint "Check which package owns each library (pacman -Qo); investigate before removing"
+else
+  ok "/etc/ld.so.preload empty or absent"
+fi
+
+# ---------------------------------------------------------------------------
+section "Firewall"
+
+if have ufw; then
+  if systemctl is-active -q ufw; then
+    if ((is_root)); then
+      st=$(ufw status verbose 2>/dev/null)
+      if grep -q 'Status: active' <<<"$st"; then
+        ok "ufw active"
+        grep -q 'Default: deny (incoming)' <<<"$st" && ok "ufw default deny incoming" ||
+          { bad "ufw default incoming policy is not deny"; fix "sudo ufw default deny incoming"; }
+        rules=$(sed -n '/^--/,$p' <<<"$st" | tail -n +2 | grep -v '^$')
+        [[ -n "$rules" ]] && { info "ufw allow rules:"; detail <<<"$rules"; }
+        grep -Eq 'ALLOW IN\s+Anywhere' <<<"$rules" &&
+          { wn "Some ufw rules allow from Anywhere (check they are intended)"
+            hint "Scope rules to your LAN, e.g. sudo ufw allow from 192.168.1.0/24 to any port <port>"; }
+      else
+        bad "ufw service running but firewall inactive"
+        fix "sudo ufw enable"
+      fi
+    else
+      ok "ufw service active"; skp "ufw rule review (needs sudo)"
+    fi
+  else
+    bad "ufw installed but not active"
+    fix "sudo systemctl enable --now ufw && sudo ufw enable"
+  fi
+else
+  have nft && ((is_root)) && [[ -n "$(nft list ruleset 2>/dev/null)" ]] && ok "nftables ruleset present" ||
+    { bad "No firewall detected"; fix "sudo pacman -S --needed ufw && sudo systemctl enable --now ufw && sudo ufw enable"; }
+fi
+
+if have ufw-docker && ((is_root)); then
+  iptables -S DOCKER-USER 2>/dev/null | grep -q ufw-user-forward &&
+    ok "ufw-docker integration present (published container ports filtered by ufw)" ||
+    { info "ufw-docker rules not loaded (fine if Docker is stopped)"; fix "sudo ufw-docker install && sudo systemctl restart ufw"; }
+fi
+
+# ---------------------------------------------------------------------------
+section "Network exposure"
+
+local_re='^(127\.|\[::1\]|::1|\[::ffff:127\.|224\.|\[ff0)|%lo:'
+bridge_re='^(172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.122\.|10\.88\.)' # docker / libvirt / podman bridges
+proc_of() { grep -oP 'users:\(\("\K[^"]+' <<<"$1" || echo "?"; }
+
+tcp_exposed="" tcp_bridge=""
+while read -r _ _ _ addr _ users; do
+  [[ -z "$addr" || "$addr" =~ $local_re ]] && continue
+  line="$addr $(proc_of "$users")"
+  [[ "$addr" =~ $bridge_re ]] && tcp_bridge+="$line"$'\n' || tcp_exposed+="$line"$'\n'
+done < <(ss -Htlnp 2>/dev/null)
+tcp_exposed=$(sort -u <<<"${tcp_exposed%$'\n'}")
+if [[ -z "$tcp_exposed" ]]; then ok "No TCP services listening on external interfaces"
+else
+  wn "TCP services listening on all/external interfaces (verify intended and firewalled):"; detail <<<"$tcp_exposed"
+  hint "Bind each service to 127.0.0.1 in its config, or keep ufw denying the port"
+fi
+[[ -n "$tcp_bridge" ]] && { info "TCP listeners on container/VM bridges only:"; sort -u <<<"${tcp_bridge%$'\n'}" | detail; }
+
+# UDP is mostly ephemeral client sockets (mDNS, WebRTC); summarize per process and only list fixed low ports
+udp_summary=$(ss -Hulnp 2>/dev/null | while read -r _ _ _ addr _ users; do
+  [[ -z "$addr" || "$addr" =~ $local_re || "$addr" =~ $bridge_re ]] && continue
+  port=${addr##*:}
+  if ((port < 1024 && port != 68 && port != 546)); then echo "port $addr $(proc_of "$users")"
+  else echo "proc $(proc_of "$users")"; fi
+done | sort | uniq -c | awk '$2=="port"{print $3, $4; next}{printf "%s: %d high-port socket(s)\n", $3, $1}')
+[[ -n "$udp_summary" ]] && { info "External UDP sockets (mDNS 5353 is LAN discovery):"; detail <<<"$udp_summary"; }
+((is_root)) || info "Run with sudo to see the owning process for every socket ('?' above)"
+
+if have resolvectl; then
+  proto=$(resolvectl status 2>/dev/null | grep -m1 'Protocols:')
+  if [[ "$proto" == *+DNSOverTLS* ]]; then ok "DNS-over-TLS enabled"
+  elif [[ -n "$proto" ]]; then info "DNS-over-TLS off (DNS queries visible to the network)"; fi
+  [[ "$proto" == *+LLMNR* ]] && {
+    wn "LLMNR enabled (name-poisoning risk on untrusted LANs)"
+    fix "sudo mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\\nLLMNR=no\\n' | sudo tee /etc/systemd/resolved.conf.d/no-llmnr.conf && sudo systemctl restart systemd-resolved"
+  }
+fi
+
+if have nmcli; then
+  open_wifi=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 ~ /wireless/{print $1}' |
+    while read -r c; do
+      km=$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$c" 2>/dev/null)
+      [[ -z "$km" ]] && echo "$c"
+    done)
+  [[ -n "$open_wifi" ]] && {
+    wn "Saved open (unencrypted) Wi-Fi networks, may auto-join:"; detail <<<"$open_wifi"
+    fix "$(while read -r c; do printf 'nmcli connection modify %q connection.autoconnect no; ' "$c"; done <<<"$open_wifi")"
+  }
+fi
+
+# ---------------------------------------------------------------------------
+section "SSH"
+
+if systemctl is-enabled -q sshd 2>/dev/null || systemctl is-active -q sshd 2>/dev/null; then
+  wn "sshd is enabled/active"
+  fix "sudo systemctl disable --now sshd"
+  if have sshd && ((is_root)); then
+    cfg=$(sshd -T 2>/dev/null)
+    chk() { local v; v=$(awk -v k="$1" '$1==k{print $2}' <<<"$cfg"); [[ " $2 " == *" $v "* ]] && ok "sshd $1 $v" || {
+      bad "sshd $1 $v (want $2)"; hint "Add '$1 ${2%% *}' to /etc/ssh/sshd_config.d/10-hardening.conf, then sudo systemctl reload sshd"; }; }
+    chk permitrootlogin "no prohibit-password"
+    chk passwordauthentication no
+    chk kbdinteractiveauthentication no
+    chk permitemptypasswords no
+    chk x11forwarding no
+  else
+    skp "sshd effective config (needs sudo)"
+  fi
+else
+  ok "sshd not enabled"
+fi
+
+ssh_dir="$target_home/.ssh"
+if [[ -d "$ssh_dir" ]]; then
+  p=$(stat -c %a "$ssh_dir")
+  [[ "$p" == 700 ]] && ok "~/.ssh perms 700" || { bad "~/.ssh perms $p (want 700)"; fix "chmod 700 ~/.ssh"; }
+  for k in "$ssh_dir"/*; do
+    [[ -f "$k" ]] || continue
+    head -c 40 "$k" 2>/dev/null | grep -q 'PRIVATE KEY' || continue
+    p=$(stat -c %a "$k")
+    [[ "$p" == 600 || "$p" == 400 ]] || { bad "${k/#$target_home/~} perms $p (want 600)"; fix "chmod 600 $(q "$k")"; }
+    if have ssh-keygen && ssh-keygen -y -P "" -f "$k" >/dev/null 2>&1; then
+      wn "${k/#$target_home/~} has no passphrase"
+      fix "ssh-keygen -p -f $(q "$k")"
+    fi
+    grep -q 'BEGIN RSA PRIVATE KEY\|BEGIN DSA' "$k" &&
+      { wn "${k/#$target_home/~} uses legacy RSA/DSA PEM format"; fix "ssh-keygen -p -o -f $(q "$k")"; }
+  done
+  [[ -f "$ssh_dir/authorized_keys" ]] &&
+    info "authorized_keys has $(grep -cv '^\s*\(#\|$\)' "$ssh_dir/authorized_keys") key(s)"
+fi
+
+# ---------------------------------------------------------------------------
+section "Users & authentication"
+
+uid0=$(awk -F: '$3==0{print $1}' /etc/passwd)
+[[ "$uid0" == root ]] && ok "Only root has UID 0" || { bad "Multiple UID 0 accounts: $(paste -sd' ' <<<"$uid0")"; hint "Any UID 0 account besides root is a backdoor; investigate, then remove with userdel"; }
+
+if need_root "Empty/locked password check"; then
+  empty=$(awk -F: '$2==""{print $1}' /etc/shadow)
+  [[ -z "$empty" ]] && ok "No accounts with empty passwords" ||
+    { bad "Accounts with empty passwords: $empty"; fix "$(for u in $empty; do printf 'sudo passwd -l %q; ' "$u"; done)"; }
+  rootpw=$(awk -F: '$1=="root"{print $2}' /etc/shadow)
+  [[ "$rootpw" == '!'* || "$rootpw" == '*'* ]] && ok "root password login locked" ||
+    info "root has a usable password (fine if intentional; sudo makes it unnecessary)"
+  weak=$(awk -F: '$2 ~ /^\$(1|2a|5)\$/{print $1}' /etc/shadow)
+  [[ -n "$weak" ]] && { wn "Accounts with legacy password hashes (md5/sha256/bcrypt-2a): $weak"; hint "Change the password (passwd) to rehash it with yescrypt"; }
+fi
+
+logins=$(awk -F: '$3>=1000 && $3<60000 && $7 !~ /(nologin|false)$/{print $1}' /etc/passwd)
+info "Interactive human accounts: $(paste -sd' ' <<<"$logins")"
+
+for g in wheel docker libvirt wireshark input; do
+  m=$(getent group "$g" | cut -d: -f4)
+  [[ -z "$m" ]] && continue
+  case "$g" in
+    docker)
+      wn "docker group (root-equivalent via the daemon socket): $m"
+      hint "Accepted risk for a dev box; for stricter isolation use rootless Docker or remove: sudo gpasswd -d $target_user docker"
+      ;;
+    libvirt) info "libvirt group (can manage VMs, near root-equivalent): $m" ;;
+    input)
+      # system users like brltty legitimately need it
+      human=$(tr , '\n' <<<"$m" | grep -Fxf <(echo "$logins"))
+      [[ -n "$human" ]] && { wn "input group (can read all keystrokes): $human"; fix "$(for u in $human; do printf 'sudo gpasswd -d %q input; ' "$u"; done)"; } ;;
+    *) info "$g group: $m" ;;
+  esac
+done
+
+if need_root "sudoers review"; then
+  nopw=$(grep -rhEv '^\s*#' /etc/sudoers /etc/sudoers.d 2>/dev/null | grep -E 'NOPASSWD' )
+  [[ -z "$nopw" ]] && ok "No NOPASSWD sudo rules" ||
+    { wn "NOPASSWD sudo rules:"; detail <<<"$nopw"; hint "Limit NOPASSWD to specific commands, or remove it with sudo visudo"; }
+  grep -rhEq '^\s*Defaults.*!authenticate' /etc/sudoers /etc/sudoers.d 2>/dev/null &&
+    { bad "sudo authentication disabled (!authenticate)"; hint "Remove the !authenticate Defaults line with sudo visudo"; }
+  visudo -c >/dev/null 2>&1 && ok "sudoers syntax valid" || { bad "sudoers has syntax errors"; fix "sudo visudo -c"; }
+fi
+
+if [[ -f /etc/security/faillock.conf ]]; then
+  dn=$(grep -E '^\s*deny\s*=' /etc/security/faillock.conf | tr -dc 0-9)
+  info "faillock deny=${dn:-3 (default)}"
+fi
+
+autologin=$(grep -rhsE '^\s*(User|autologin-user)\s*=' /etc/sddm.conf /etc/sddm.conf.d/ 2>/dev/null | head -1)
+grep -rqsE -- '--autologin' /etc/systemd/system/getty@*.service.d/ && autologin+=" getty"
+if [[ -n "$autologin" ]]; then
+  info "Autologin enabled (${autologin// /}) - acceptable only because the LUKS passphrase gates boot"
+fi
+
+# ---------------------------------------------------------------------------
+section "Screen lock"
+
+shell_conf="$target_home/.config/omarchy/shell.json"
+idle_conf="$target_home/.config/hypr/hypridle.conf"
+if [[ -f "$shell_conf" ]] && have jq; then
+  # Omarchy shell handles idle itself; lock timeout lives in shell.json
+  lock_t=$(jq -r '.idle.lock // empty' "$shell_conf" 2>/dev/null)
+  if [[ -f "$target_home/.local/state/omarchy/indicators/stay-awake" ]]; then
+    wn "Omarchy 'stay awake' is on: idle lock disabled"
+    fix "omarchy-toggle-idle allow-idle"
+  elif [[ "$lock_t" =~ ^[0-9]+$ ]] && ((lock_t > 0)); then
+    ((lock_t <= 600)) && ok "Omarchy idle lock after ${lock_t}s" ||
+      { wn "Omarchy idle lock after ${lock_t}s (consider <= 600)"; hint "Lower .idle.lock in ~/.config/omarchy/shell.json"; }
+  else
+    wn "No idle lock timeout set in ${shell_conf/#$target_home/~} (.idle.lock)"
+    hint "Set .idle.lock to e.g. 300 in ~/.config/omarchy/shell.json"
+  fi
+  systemctl --user -M "$target_user@" is-active -q omarchy-sleep-lock.service 2>/dev/null ||
+    systemctl --user is-active -q omarchy-sleep-lock.service 2>/dev/null &&
+    ok "Lock-before-suspend service active" ||
+    { wn "omarchy-sleep-lock.service not active (no lock on suspend)"; fix "systemctl --user enable --now omarchy-sleep-lock.service"; }
+elif [[ -f "$idle_conf" ]]; then
+  pgrep -x hypridle >/dev/null && ok "hypridle running" || wn "hypridle not running (no automatic lock on idle)"
+  lock_t=$(awk '/listener/{l=1} l&&/timeout/{t=$3} l&&/on-timeout.*lock/{print t; exit}' "$idle_conf")
+  if [[ -n "$lock_t" ]]; then
+    ((lock_t <= 600)) && ok "Idle lock after ${lock_t}s" || wn "Idle lock after ${lock_t}s (consider <= 600)"
+  else
+    wn "No lock listener found in hypridle.conf"
+  fi
+else
+  wn "No idle lock configuration found"
+fi
+
+# ---------------------------------------------------------------------------
+section "Filesystem permissions"
+
+for f in /etc/shadow /etc/gshadow; do
+  [[ -e "$f" ]] || continue
+  p=$(stat -c '%a %U' "$f")
+  [[ "${p%% *}" =~ ^[0-6]00$|^0$ ]] && ok "$f $p" || { bad "$f $p (should not be group/world readable)"; fix "sudo chmod 600 $f"; }
+done
+p=$(stat -c %a /etc/sudoers); [[ "$p" == 440 || "$p" == 400 ]] && ok "/etc/sudoers $p" || { bad "/etc/sudoers $p"; fix "sudo chmod 440 /etc/sudoers"; }
+p=$(stat -c %a "$target_home"); [[ "$p" =~ ^7[0-5]0$ ]] && ok "Home dir $p" || { wn "Home dir $p (others can read it)"; fix "chmod 700 $(q "$target_home")"; }
+
+ww=$(find /etc /usr /boot /opt -xdev -type f -perm -0002 ! -type l 2>/dev/null | head -20)
+[[ -z "$ww" ]] && ok "No world-writable files in /etc /usr /boot /opt" || { bad "World-writable system files:"; detail <<<"$ww"; fix "sudo chmod o-w $(xargs -d'\n' printf '%q ' <<<"$ww")"; }
+
+wwd=$(find / -xdev -type d -perm -0002 ! -perm -1000 \
+  ! -path '/proc/*' ! -path '/sys/*' ! -path '/dev/*' 2>/dev/null | head -20)
+[[ -z "$wwd" ]] && ok "All world-writable dirs have the sticky bit" || { wn "World-writable dirs without sticky bit:"; detail <<<"$wwd"; fix "sudo chmod +t $(xargs -d'\n' printf '%q ' <<<"$wwd")"; }
+
+if [[ -n "$deep" ]]; then
+  suid_paths=(/)
+else
+  suid_paths=(/usr /opt /etc /home /var /srv)
+fi
+info "Scanning ${suid_paths[*]} for SUID/SGID binaries not owned by any package..."
+rogue=""
+while IFS= read -r f; do
+  pacman -Qoq "$f" >/dev/null 2>&1 || rogue+="$f"$'\n'
+done < <(find "${suid_paths[@]}" -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
+rogue=${rogue%$'\n'}
+if [[ -z "$rogue" ]]; then ok "All SUID/SGID binaries belong to packages"
+else
+  bad "SUID/SGID binaries not owned by any package:"; detail <<<"$rogue"
+  hint "Find where each came from; if not needed, drop the bit with sudo chmod u-s,g-s <file>"
+fi
+
+# PATH directories writable by others let them shadow commands
+for d in ${PATH//:/ }; do
+  [[ -d "$d" ]] || continue
+  p=$(stat -Lc %a "$d")
+  [[ "$p" =~ [2367]$ || ( "$p" =~ [2367].$ && "$(stat -Lc %G "$d")" != "$target_user" ) ]] &&
+    { bad "PATH dir $d is group/world-writable ($p)"; fix "chmod go-w $(q "$(readlink -f "$d")")"; }
+done
+[[ ":$PATH:" == *::* || ":$PATH:" == *:.:* ]] && { bad "PATH contains the current directory"; hint "Remove '.' or empty entries from PATH in your shell rc"; }
+
+# ---------------------------------------------------------------------------
+section "Services & persistence"
+
+failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+[[ -z "$failed" ]] && ok "No failed system units" || { wn "Failed system units:"; detail <<<"$failed"; hint "Inspect with: journalctl -b -u <unit>"; }
+
+custom_units=$(find /etc/systemd/system -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) 2>/dev/null)
+[[ -n "$custom_units" ]] && { info "Locally created system units (not from packages):"; detail <<<"$custom_units"; }
+
+user_units=$(find "$target_home/.config/systemd/user" -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) 2>/dev/null)
+[[ -n "$user_units" ]] && { info "User systemd units (persistence points):"; sed "s#$target_home#~#" <<<"$user_units" | detail; }
+
+autostart=$(ls "$target_home"/.config/autostart/*.desktop /etc/xdg/autostart/*.desktop 2>/dev/null)
+[[ -n "$autostart" ]] && info "$(wc -l <<<"$autostart") XDG autostart entries (~/.config/autostart, /etc/xdg/autostart)"
+
+crons=$(ls /etc/cron.d /var/spool/cron 2>/dev/null | grep -v '^\s*$' | grep -v ':$')
+[[ -n "$crons" ]] && { info "Cron entries present:"; detail <<<"$crons"; }
+
+for f in "$target_home"/.zshrc "$target_home"/.bashrc "$target_home"/.profile "$target_home"/.zprofile "$target_home"/.bash_profile; do
+  [[ -f "$f" ]] || continue
+  hits=$(grep -nE '(curl|wget)[^|#]*\|\s*(ba|z)?sh|base64 -d.*\|\s*(ba)?sh|/dev/tcp/|\bnc\b.*-e' "$f" 2>/dev/null)
+  [[ -n "$hits" ]] && { wn "Suspicious remote-exec pattern in ${f/#$target_home/~}:"; detail <<<"$hits"; hint "Make sure you added these lines yourself"; }
+done
+
+journal_store=$(grep -hE '^\s*Storage=' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | tail -1)
+[[ -d /var/log/journal ]] && ok "Persistent journal enabled" || { wn "Journal is volatile (${journal_store:-Storage=auto}); logs lost on reboot"; fix "sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald"; }
+systemctl is-active -q auditd && ok "auditd running" || info "auditd not running (installed: $(pacman -Q audit >/dev/null 2>&1 && echo yes || echo no))"
+
+# ---------------------------------------------------------------------------
+section "Containers & VMs"
+
+if have docker; then
+  if systemctl is-active -q docker; then
+    info "Docker daemon running"
+    grep -Eq 'tcp://' /etc/docker/daemon.json /etc/systemd/system/docker.service.d/*.conf 2>/dev/null &&
+      { bad "Docker daemon exposed over TCP"; hint "Remove tcp:// hosts from /etc/docker/daemon.json; use SSH contexts for remote access"; }
+    if docker info >/dev/null 2>&1; then
+      while read -r id name; do
+        [[ -z "$id" ]] && continue
+        insp=$(docker inspect "$id")
+        grep -q '"Privileged": true' <<<"$insp" &&
+          { bad "Container $name is privileged"; hint "Recreate without --privileged; add only the devices/capabilities it needs"; }
+        grep -q '"NetworkMode": "host"' <<<"$insp" &&
+          { wn "Container $name uses host networking (bypasses ufw-docker)"; hint "Use a bridge network and publish only needed ports on 127.0.0.1"; }
+        grep -q '/var/run/docker.sock\|/run/docker.sock' <<<"$insp" &&
+          { bad "Container $name mounts the Docker socket"; hint "Socket access is root on the host; use a socket proxy with a read-only allowlist"; }
+        grep -Eq '"CapAdd": \[[^]]*"(SYS_ADMIN|ALL|NET_ADMIN|SYS_PTRACE)"' <<<"$insp" &&
+          { wn "Container $name has dangerous capabilities"; hint "Drop the cap_add entries the container does not strictly need"; }
+        pubs=$(docker port "$id" 2>/dev/null | grep -Ev '127\.0\.0\.1|\[::1\]')
+        [[ -n "$pubs" ]] && { wn "Container $name publishes ports on all interfaces:"; detail <<<"$pubs"
+          hint "Publish as 127.0.0.1:<host>:<container> unless the LAN needs it"; }
+      done < <(docker ps --format '{{.ID}} {{.Names}}')
+    else
+      skp "Container inspection (no access to docker socket)"
+    fi
+  else
+    ok "Docker daemon not running"
+  fi
+fi
+
+if systemctl is-active -q libvirtd 2>/dev/null; then info "libvirtd running"; fi
+
+# ---------------------------------------------------------------------------
+section "Secrets & credentials in home"
+
+# Report file locations and counts only; never print secret values
+check_perm() { # file
+  [[ -e "$1" ]] || return
+  local p; p=$(stat -c %a "$1")
+  if [[ "$p" =~ [1-7]$ || "$p" =~ [4-7].$ ]]; then
+    bad "${1/#$target_home/~} perms $p (readable by others, want 600)"
+    [[ -d "$1" ]] && fix "chmod 700 $(q "$1")" || fix "chmod 600 $(q "$1")"
+  else ok "${1/#$target_home/~} perms $p"; fi
+}
+for f in .aws/credentials .kube/config .docker/config.json .netrc .git-credentials .pgpass \
+  .config/gh/hosts.yml .npmrc .pypirc .config/rclone/rclone.conf .vault-token .terraform.d/credentials.tfrc.json \
+  .claude.json .config/hcloud/cli.toml .gnupg; do
+  check_perm "$target_home/$f"
+done
+
+[[ -f "$target_home/.git-credentials" ]] && {
+  wn "~/.git-credentials stores tokens in plaintext"
+  hint "Switch to the keyring: git config --global credential.helper /usr/lib/git-core/git-credential-libsecret, then delete the file"
+}
+[[ -f "$target_home/.docker/config.json" ]] && grep -q '"auth"' "$target_home/.docker/config.json" && {
+  wn "~/.docker/config.json contains plaintext registry auth"
+  hint "Use a credential store (docker-credential-secretservice) and set \"credsStore\" in config.json"
+}
+
+secret_re='(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(password|passwd|secret|token)=[^ ]{6,})'
+for h in "$target_home"/.zsh_history "$target_home"/.bash_history "$target_home"/.local/share/fish/fish_history; do
+  [[ -f "$h" ]] || continue
+  n=$(grep -aEc "$secret_re" "$h" 2>/dev/null)
+  ((n > 0)) && { wn "${h/#$target_home/~}: $n line(s) look like secrets/tokens (values not shown)"
+    hint "Rotate those credentials, then delete the lines; in zsh, setopt HIST_IGNORE_SPACE and prefix secret commands with a space"; } ||
+    ok "${h/#$target_home/~}: no obvious secrets"
+done
+
+info "Scanning home for .env / key files readable by others..."
+# Toolchain/package dirs ship public test certs; skip them
+loose=$(find "$target_home" -xdev \( -path "$target_home/.cache" -o -path "$target_home/.local/share/Trash" \
+  -o -path "$target_home/.local/share/mise" -o -path "$target_home/go" -o -path "$target_home/.cargo" \
+  -o -path "$target_home/.rustup" -o -path "$target_home/.npm" -o -path "$target_home/.m2" \
+  -o -path "$target_home/.gradle" -o -path "$target_home/.local/lib" -o -name site-packages \
+  -o -name node_modules -o -name .git -o -name testdata \) -prune -o -type f \
+  \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name 'id_*' ! -name '*.pub' -o -name '*.kdbx' \
+  -o -name '*.ovpn' -o -name 'kubeconfig*' \) ! -name '*.example' ! -name '*.sample' -perm /044 -print 2>/dev/null | head -30)
+if [[ -z "$loose" ]]; then ok "No group/world-readable .env/key files found"
+else
+  wn "Secret-like files readable by group/others:"; sed "s#$target_home#~#" <<<"$loose" | detail
+  fix "chmod 600 $(xargs -d'\n' printf '%q ' <<<"$loose")"
+fi
+
+# ---------------------------------------------------------------------------
+section "Rootkit & malware indicators"
+
+hidden_mods=$(comm -13 <(lsmod | awk 'NR>1{print $1}' | sort) <(ls /sys/module | sort) 2>/dev/null |
+  while read -r m; do [[ -f /sys/module/$m/initstate ]] && echo "$m"; done)
+[[ -z "$hidden_mods" ]] && ok "No loaded modules hidden from lsmod" || { bad "Modules in /sys/module but hidden from lsmod:"; detail <<<"$hidden_mods"; hint "Possible kernel rootkit: boot a live USB and scan the disk offline"; }
+
+ps_pids=$(ps -e -o pid= | tr -d ' ' | sort -u)
+proc_pids=$(ls /proc | grep -E '^[0-9]+$' | sort -u)
+hidden=$(comm -13 <(echo "$ps_pids") <(echo "$proc_pids") | while read -r p; do [[ -d /proc/$p ]] && echo "$p"; done)
+[[ -z "$hidden" ]] && ok "No processes hidden from ps" || { wn "PIDs in /proc not shown by ps (may be short-lived): $(paste -sd' ' <<<"$hidden")"; hint "Re-run; if the same PIDs persist, inspect /proc/<pid>/cmdline and exe"; }
+
+deleted=$(for e in /proc/[0-9]*/exe; do
+  t=$(readlink "$e" 2>/dev/null) || continue
+  [[ "$t" == *" (deleted)" ]] && echo "${t% (deleted)}"
+done | grep -v '^/memfd:' | sort | uniq -c | sort -rn | awk '{printf "%s (%d proc)\n", $2, $1}')
+if [[ -n "$deleted" ]]; then
+  odd=$(grep -Ev '^/(usr|opt)/' <<<"$deleted")
+  [[ -n "$odd" ]] && { wn "Processes running from deleted binaries outside /usr,/opt (malware often self-deletes):"; detail <<<"$odd"
+    hint "Find the PIDs with: ls -l /proc/*/exe 2>/dev/null | grep deleted"; }
+  sys=$(grep -E '^/(usr|opt)/' <<<"$deleted")
+  [[ -n "$sys" ]] && { info "Processes still running pre-upgrade binaries (restart them):"; detail <<<"$sys"; }
+fi
+
+tmp_exec=$(find /tmp /var/tmp /dev/shm -xdev -type f -perm -u+x 2>/dev/null | head -10)
+[[ -z "$tmp_exec" ]] && ok "No executables in /tmp, /var/tmp, /dev/shm" || { wn "Executables in temp dirs:"; detail <<<"$tmp_exec"; hint "Check what created them; delete if unknown"; }
+
+have rkhunter && ((is_root)) && info "rkhunter installed: run 'sudo rkhunter --check --sk' for a deeper scan"
+have rkhunter || { info "Optional deeper scanners not installed: rkhunter, lynis"; fix "sudo pacman -S --needed rkhunter lynis"; }
+
+# ---------------------------------------------------------------------------
+flush
+section "Summary"
+printf '  %sPASS %d%s   %sWARN %d%s   %sFAIL %d%s   %sSKIP %d%s\n' \
+  "$G" "$pass" "$N" "$Y" "$warn" "$N" "$R" "$fail" "$N" "$D" "$skip" "$N"
+((is_root)) || printf '  %sRe-run with sudo for full coverage: sudo %s%s\n' "$D" "$0" "$N"
+[[ -n "$report" ]] && printf '  Report written to %s\n' "$report"
+
+((fail > 0)) && exit 1
+exit 0

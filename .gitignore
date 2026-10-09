@@ -1,0 +1,13 @@
+# Python / uv caches from running secaudit-tui
+__pycache__/
+*.pyc
+.venv/
+
+# Scan output; real results live in ~/.local/state/secaudit
+*.jsonl
+report.md
+
+# Editors
+.idea/
+.vscode/
+*.swp

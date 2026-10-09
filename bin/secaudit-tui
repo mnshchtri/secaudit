@@ -1,0 +1,1580 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["textual>=8,<9"]
+# ///
+"""Security Audit: a terminal app for the secaudit engine.
+
+Runs scans with live progress, lets you browse and search findings, apply
+suggested fixes, compare against earlier scans and export reports.
+Scan data is shared with secaudit-ui under ~/.local/state/secaudit/runs.
+
+Usage: secaudit-tui [--scan quick|full|deep]
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import time
+import tomllib
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult, SystemCommand
+from textual.binding import Binding
+from textual.containers import Center, Container, Horizontal, Vertical, VerticalScroll
+from textual.reactive import reactive
+from textual.screen import ModalScreen, Screen
+from textual.theme import Theme
+from textual.widget import Widget
+from textual.widgets import (
+    Button,
+    DataTable,
+    Digits,
+    Footer,
+    Input,
+    ListItem,
+    ListView,
+    Log,
+    OptionList,
+    ProgressBar,
+    RichLog,
+    Sparkline,
+    Static,
+    Tab,
+    Tabs,
+)
+from textual.widgets.option_list import Option
+
+ENGINE = Path(os.environ.get("SECAUDIT_ENGINE") or Path(__file__).resolve().parent / "secaudit")
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "secaudit"
+RUNS = STATE / "runs"
+ACCEPTED_FILE = STATE / "accepted.json"
+KEEP_RUNS = 30
+HOST = socket.gethostname()
+USER = os.environ.get("USER", "")
+WIDE = 150  # columns at which the detail pane moves beside the table
+NARROW = 110  # below this the trend box and sidebar shrink
+
+
+# ---------------------------------------------------------------------------
+# Theme: follow the active Omarchy theme, with neutral fallbacks
+
+
+@dataclass
+class Palette:
+    dark: bool = True
+    accent: str = "#4b8ef4"
+    accent2: str = "#74aeff"
+    fg: str = "#e6e6e6"
+    bg: str = "#101010"
+    panel: str = "#1d1d1d"
+    muted: str = "#6b6b6b"
+    red: str = "#e06c75"
+    yellow: str = "#e5c07b"
+    green: str = "#98c379"
+
+
+def load_palette() -> Palette:
+    path = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
+    try:
+        c = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return Palette()
+    p = Palette()
+    return Palette(
+        dark=c.get("mode", "dark") != "light",
+        accent=c.get("accent", p.accent),
+        accent2=c.get("bright_magenta", c.get("accent", p.accent2)),
+        fg=c.get("foreground", p.fg),
+        bg=c.get("background", p.bg),
+        panel=c.get("lighter_bg", p.panel),
+        muted=c.get("muted", p.muted),
+        # Bright variants read better as status colors on dark themes
+        red=c.get("bright_red" if c.get("mode") != "light" else "red", p.red),
+        yellow=c.get("bright_yellow" if c.get("mode") != "light" else "yellow", p.yellow),
+        green=c.get("green", p.green),
+    )
+
+
+PAL = load_palette()
+
+SEV = {
+    "fail": ("✗", "FAIL", "red"),
+    "warn": ("!", "WARN", "yellow"),
+    "info": ("i", "NOTE", "accent"),
+    "skip": ("–", "SKIP", "muted"),
+    "pass": ("✓", "PASS", "green"),
+}
+SEV_ORDER = {"fail": 0, "warn": 1, "info": 2, "skip": 3, "pass": 4}
+
+
+def in_tab(f: "Finding", tab: str) -> bool:
+    if tab == "issues":
+        return f.sev in ("fail", "warn") and not f.accepted
+    if tab == "accepted":
+        return f.accepted
+    if tab == "notes":
+        return f.sev in ("info", "skip")
+    if tab == "passed":
+        return f.sev == "pass"
+    return True
+
+
+def sev_color(sev: str) -> str:
+    return getattr(PAL, SEV.get(sev, SEV["info"])[2])
+
+
+def sev_badge(sev: str) -> Text:
+    icon, label, _ = SEV.get(sev, SEV["info"])
+    return Text(f"{icon} {label}", style=f"bold {sev_color(sev)}")
+
+
+# ---------------------------------------------------------------------------
+# Accepted risks: issues you have decided to live with. Keyed by section and
+# message with numbers masked, so "2 line(s)" and "3 line(s)" match the same
+# finding across scans.
+
+
+def accept_key(section: str, msg: str) -> str:
+    return f"{section}|{re.sub(r'[0-9]+', '#', msg.strip().rstrip(':'))}"
+
+
+def load_accepted() -> dict[str, dict]:
+    try:
+        data = json.loads(ACCEPTED_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_accepted(data: dict[str, dict]) -> None:
+    ACCEPTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ACCEPTED_FILE.write_text(json.dumps(data, indent=2))
+
+
+ACCEPTED = load_accepted()
+
+
+# ---------------------------------------------------------------------------
+# Run data. Each run is a directory with findings.jsonl, meta.json,
+# output.txt and optionally applied (line numbers of fixes applied).
+
+
+@dataclass
+class Finding:
+    n: int  # 1-based line in findings.jsonl; stable id within a run
+    sev: str
+    section: str
+    msg: str
+    detail: str
+    fix: str
+    hint: str
+    accepted: bool = False
+
+    @property
+    def is_issue(self) -> bool:
+        return self.sev in ("fail", "warn")
+
+    @property
+    def accept_key(self) -> str:
+        return accept_key(self.section, self.msg)
+
+    @property
+    def title(self) -> str:
+        return self.msg.rstrip().rstrip(":")
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.sev, self.section, self.msg)
+
+
+class Run:
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            self.meta = json.loads((path / "meta.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            self.meta = {}
+        self.findings: list[Finding] = []
+        for i, line in enumerate((path / "findings.jsonl").read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            self.findings.append(
+                Finding(i, d.get("sev", "info"), d.get("section", ""), d.get("msg", ""),
+                        d.get("detail", ""), d.get("fix", ""), d.get("hint", ""))
+            )
+        self.recount()
+
+    def recount(self) -> None:
+        """Apply accepted risks; accepted issues no longer count as fail/warn."""
+        self.counts = {s: 0 for s in SEV} | {"accepted": 0}
+        for f in self.findings:
+            f.accepted = f.is_issue and f.accept_key in ACCEPTED
+            self.counts["accepted" if f.accepted else f.sev] += 1
+
+    @property
+    def complete(self) -> bool:
+        return "finished" in self.meta
+
+    @property
+    def mode(self) -> str:
+        return self.meta.get("mode", "?")
+
+    @property
+    def started(self) -> datetime:
+        return datetime.fromtimestamp(self.meta.get("started") or self.path.stat().st_mtime)
+
+    @property
+    def duration(self) -> int | None:
+        s, f = self.meta.get("started"), self.meta.get("finished")
+        return f - s if s and f else None
+
+    @property
+    def score(self) -> int:
+        return max(0, 100 - 10 * self.counts["fail"] - 2 * self.counts["warn"])
+
+    @property
+    def grade(self) -> str:
+        s = self.score
+        return "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 70 else "D" if s >= 60 else "F"
+
+    @property
+    def issue_keys(self) -> set[tuple[str, str, str]]:
+        return {f.key for f in self.findings if f.is_issue and not f.accepted}
+
+    @property
+    def applied(self) -> set[int]:
+        try:
+            return {int(x) for x in (self.path / "applied").read_text().split()}
+        except (OSError, ValueError):
+            return set()
+
+    def mark_applied(self, n: int) -> None:
+        with open(self.path / "applied", "a") as fh:
+            fh.write(f"{n}\n")
+
+
+def load_runs() -> list[Run]:
+    runs = []
+    if RUNS.is_dir():
+        for d in sorted(RUNS.iterdir(), reverse=True):
+            if (d / "findings.jsonl").is_file() and (d / "findings.jsonl").stat().st_size:
+                try:
+                    run = Run(d)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if run.complete:
+                    runs.append(run)
+    return runs
+
+
+def prune_incomplete(min_age: int = 600) -> None:
+    """Remove leftovers of scans that never finished (killed terminal, crash)."""
+    if not RUNS.is_dir():
+        return
+    for d in RUNS.iterdir():
+        try:
+            meta = json.loads((d / "meta.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        if "finished" not in meta and time.time() - d.stat().st_mtime > min_age:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def grade_class(grade: str) -> str:
+    return {"A": "good", "B": "good", "C": "mid", "D": "mid"}.get(grade, "bad")
+
+
+def grade_color(grade: str) -> str:
+    return {"good": PAL.green, "mid": PAL.yellow, "bad": PAL.red}[grade_class(grade)]
+
+
+def ago(dt: datetime) -> str:
+    d = int(time.time() - dt.timestamp())
+    if d < 60:
+        return "just now"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
+
+
+def mmss(sec: int) -> str:
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def engine_sections() -> list[str]:
+    try:
+        src = ENGINE.read_text()
+    except OSError:
+        return []
+    return [s for s in re.findall(r'^section "([^"]+)"', src, re.M) if s != "Summary"]
+
+
+def clip(text: str, width: int) -> Text:
+    t = Text(text.replace("\n", " "))
+    t.truncate(max(width, 1), overflow="ellipsis")
+    return t
+
+
+def copy_to_clipboard(app: App, text: str) -> None:
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy"], input=text.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    else:
+        app.copy_to_clipboard(text)  # OSC 52 fallback
+
+
+def export_markdown(run: Run) -> Path:
+    issues = [f for f in run.findings if f.is_issue and not f.accepted]
+    sections: list[str] = []
+    for f in issues:
+        if f.section not in sections:
+            sections.append(f.section)
+    c = run.counts
+    lines = [
+        f"# Security audit: {run.meta.get('host', HOST)}",
+        "",
+        f"{run.started:%Y-%m-%d %H:%M} · {run.mode} scan · kernel {run.meta.get('kernel', '?')} · "
+        f"score **{run.score} ({run.grade})** · {c['fail']} fail · {c['warn']} warn",
+        "",
+    ]
+    for sec in sections:
+        lines += [f"## {sec}", ""]
+        for f in sorted((f for f in issues if f.section == sec), key=lambda f: SEV_ORDER[f.sev]):
+            lines.append(f"- [ ] **{f.sev.upper()}** {f.title}")
+            if f.detail:
+                lines += ["", "  ```", *(f"  {l}" for l in f.detail.splitlines()), "  ```"]
+            if f.fix:
+                lines += ["", f"  Fix: `{f.fix}`"]
+            if f.hint:
+                lines += ["", f"  {f.hint}"]
+            lines.append("")
+    out = run.path / "report.md"
+    out.write_text("\n".join(lines))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Shared widgets
+
+
+class TopBar(Widget):
+    """One-line title bar: app name and host on the left, context on the right."""
+
+    DEFAULT_CSS = "TopBar { height: 1; background: $panel; }"
+    right: reactive[str] = reactive("")
+
+    def render(self) -> Text:
+        left = Text.assemble(
+            (" ◆ ", f"bold {PAL.accent}"), ("Security Audit", "bold"), (f"   {HOST} · {USER}", PAL.muted)
+        )
+        r = Text(self.right, style=PAL.muted)
+        pad = max(1, self.size.width - left.cell_len - r.cell_len - 1)
+        return Text.assemble(left, " " * pad, r, " ")
+
+
+class SectionItem(ListItem):
+    def __init__(self, section: str | None, label: Text):
+        super().__init__(Static(label))
+        self.section = section
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("y", "answer(True)", "Yes"),
+        Binding("n,escape", "answer(False)", "No"),
+    ]
+
+    def __init__(self, title: str, code: str | Text | None = None, note: str = "", ok: str = "Run", danger: bool = False):
+        super().__init__()
+        self.title_text, self.code, self.note, self.ok, self.danger = title, code, note, ok, danger
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static(self.title_text, classes="dialog-title")
+            if self.code:
+                with VerticalScroll(id="dialog-code"):
+                    yield Static(self.code if isinstance(self.code, Text) else Text(self.code), classes="code")
+            if self.note:
+                yield Static(self.note, classes="dialog-note")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancel  n", id="no")
+                yield Button(f"{self.ok}  y", id="yes", variant="error" if self.danger else "primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#no", Button).focus()
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
+
+    def action_answer(self, value: bool) -> None:
+        self.dismiss(value)
+
+
+class ScanChooser(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("escape", "dismiss(None)", "Cancel"),
+        Binding("f", "dismiss('full')", "Full", show=False),
+        Binding("q", "dismiss('quick')", "Quick", show=False),
+        Binding("d", "dismiss('deep')", "Deep", show=False),
+    ]
+
+    MODES = [
+        ("full", "Full scan", "f", "sudo · every check · about 20 seconds"),
+        ("quick", "Quick scan", "q", "no sudo · skips root-only checks · about 10 seconds"),
+        ("deep", "Deep scan", "d", "sudo · adds package integrity and whole-disk SUID · several minutes"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static("Start a scan", classes="dialog-title")
+            options = []
+            for mode, name, key, desc in self.MODES:
+                prompt = Text.assemble((name, "bold"), (f"  {key}", PAL.accent), "\n", (desc, PAL.muted))
+                options.append(Option(prompt, id=mode))
+            yield OptionList(*options, id="chooser-list")
+            yield Static("All scans are read-only. sudo is only used to read root-owned files.", classes="dialog-note")
+
+    @on(OptionList.OptionSelected)
+    def chosen(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+
+# ---------------------------------------------------------------------------
+# Scan screen
+
+
+class ScanScreen(Screen[Path | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel scan")]
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, mode: str):
+        super().__init__()
+        self.mode = mode
+        self.sections = engine_sections()
+        self.state = {s: {"status": "pending", "warn": 0, "fail": 0} for s in self.sections}
+        self.current: str | None = None
+        self.proc: asyncio.subprocess.Process | None = None
+        self.cancelled = False
+        self.failed = False
+        self.started = time.time()
+        self.frame = 0
+        self.dir: Path | None = None
+
+    def compose(self) -> ComposeResult:
+        yield TopBar()
+        with Center():
+            with Vertical(id="scanbox"):
+                yield Static(id="scan-title")
+                yield ProgressBar(total=max(len(self.sections), 1), show_eta=False, id="scan-progress")
+                yield Static(id="scan-elapsed")
+                with Vertical(id="checklist"):
+                    for i, _ in enumerate(self.sections):
+                        yield Static(id=f"sec-{i}", classes="check")
+                yield Static("LIVE FINDINGS", classes="caption")
+                yield RichLog(id="scan-log", markup=False, wrap=True, max_lines=300)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        who = USER if self.mode == "quick" else "root"
+        self.query_one(TopBar).right = f"{self.mode} scan · as {who}"
+        self.query_one("#scan-title", Static).update(Text(f"Scanning {HOST}…", style="bold"))
+        self.render_rows()
+        self.set_interval(0.1, self.tick)
+        self.run_engine()
+
+    def tick(self) -> None:
+        if self.proc is None or self.proc.returncode is not None:
+            return
+        self.frame += 1
+        self.query_one("#scan-elapsed", Static).update(
+            Text(f"{mmss(int(time.time() - self.started))} elapsed · press escape to cancel", style=PAL.muted)
+        )
+        if self.current in self.state:
+            self.render_row(self.sections.index(self.current))
+
+    def render_rows(self) -> None:
+        for i in range(len(self.sections)):
+            self.render_row(i)
+
+    def render_row(self, i: int) -> None:
+        name = self.sections[i]
+        st = self.state[name]
+        if st["status"] == "done":
+            if st["fail"]:
+                icon = Text("✗", style=f"bold {PAL.red}")
+            elif st["warn"]:
+                icon = Text("!", style=f"bold {PAL.yellow}")
+            else:
+                icon = Text("✓", style=f"bold {PAL.green}")
+            counts = Text()
+            if st["fail"]:
+                counts.append(f"{st['fail']} fail  ", style=PAL.red)
+            if st["warn"]:
+                counts.append(f"{st['warn']} warn", style=PAL.yellow)
+            row = Text.assemble(" ", icon, "  ", (f"{name:<34}", ""), counts)
+        elif st["status"] == "running":
+            spin = self.FRAMES[self.frame % len(self.FRAMES)]
+            row = Text.assemble(" ", (spin, f"bold {PAL.accent}"), "  ", (f"{name:<34}", "bold"), ("checking…", f"italic {PAL.muted}"))
+        else:
+            row = Text.assemble(" ", ("·", PAL.muted), "  ", (name, PAL.muted))
+        self.query_one(f"#sec-{i}", Static).update(row)
+
+    def advance(self, new_section: str | None) -> None:
+        if self.current in self.state:
+            self.state[self.current]["status"] = "done"
+            self.render_row(self.sections.index(self.current))
+        self.current = new_section
+        if new_section in self.state:
+            self.state[new_section]["status"] = "running"
+            self.render_row(self.sections.index(new_section))
+        done = sum(1 for s in self.state.values() if s["status"] == "done")
+        self.query_one(ProgressBar).update(progress=done)
+
+    def parse(self, line: str) -> None:
+        if m := re.match(r"^== (.+) ==$", line):
+            self.advance(None if m.group(1) == "Summary" else m.group(1))
+            return
+        m = re.match(r"^\s+\[(WARN|FAIL)\] (.*)", line)
+        if m and self.current in self.state:
+            sev = m.group(1).lower()
+            self.state[self.current][sev] += 1
+            self.query_one(RichLog).write(
+                Text.assemble(sev_badge(sev), "  ", (f"{self.current}: ", PAL.muted), m.group(2).rstrip(":"))
+            )
+
+    @work(exclusive=True)
+    async def run_engine(self) -> None:
+        self.dir = RUNS / datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        meta = {"mode": self.mode, "started": int(self.started), "host": HOST, "user": USER, "kernel": os.uname().release}
+        (self.dir / "meta.json").write_text(json.dumps(meta))
+
+        cmd = [str(ENGINE), "--json", str(self.dir / "findings.jsonl")]
+        if self.mode == "deep":
+            cmd.append("--deep")
+        if self.mode != "quick":
+            cmd = ["sudo", "-n", *cmd]  # credentials were cached before this screen opened
+
+        with open(self.dir / "output.txt", "w") as out:
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT, start_new_session=True,
+                )
+            except OSError as e:
+                return self.fail(str(e))
+            assert self.proc.stdout
+            async for raw in self.proc.stdout:
+                line = raw.decode(errors="replace").rstrip("\n")
+                out.write(line + "\n")
+                self.parse(line)
+            await self.proc.wait()
+
+        if self.cancelled:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            return
+        findings = self.dir / "findings.jsonl"
+        if not findings.is_file() or not findings.stat().st_size:
+            tail = (self.dir / "output.txt").read_text().strip().splitlines()[-3:]
+            shutil.rmtree(self.dir, ignore_errors=True)
+            return self.fail("\n".join(tail) or f"exit status {self.proc.returncode}")
+
+        meta["finished"] = int(time.time())
+        (self.dir / "meta.json").write_text(json.dumps(meta))
+        for old in [r.path for r in load_runs()][KEEP_RUNS:]:
+            shutil.rmtree(old, ignore_errors=True)
+
+        self.advance(None)
+        self.query_one(ProgressBar).update(progress=len(self.sections))
+        self.query_one("#scan-elapsed", Static).update(
+            Text(f"Finished in {mmss(int(time.time() - self.started))}", style=PAL.green)
+        )
+        await asyncio.sleep(0.6)
+        self.dismiss(self.dir)
+
+    def fail(self, reason: str) -> None:
+        self.failed = True
+        self.query_one("#scan-title", Static).update(Text("Scan failed", style=f"bold {PAL.red}"))
+        self.query_one("#scan-elapsed", Static).update(Text("press escape to go back", style=PAL.muted))
+        self.query_one(RichLog).write(Text(reason, style=PAL.red))
+
+    def stop_engine(self) -> None:
+        if self.proc and self.proc.returncode is None:
+            self.cancelled = True
+            try:
+                # Our own session: signal the whole tree. Under sudo we can only reach
+                # sudo itself, which relays the signal to the engine.
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                self.proc.terminate()
+        if self.cancelled and self.dir:
+            # The worker dies with this screen, so clean up here; wait a moment for
+            # the engine's last write to land before removing the directory
+            d = self.dir
+            self.app.set_timer(1.5, lambda: shutil.rmtree(d, ignore_errors=True))
+
+    def action_cancel(self) -> None:
+        self.stop_engine()
+        self.dismiss(None)
+
+    def on_unmount(self) -> None:
+        # Quitting the app mid-scan must not leave the engine running
+        self.stop_engine()
+
+
+# ---------------------------------------------------------------------------
+# History screen
+
+
+class HistoryScreen(Screen[Path | None]):
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("enter", "open", "Open scan"),
+        Binding("delete,d", "delete", "Delete scan"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield TopBar()
+        with Horizontal(id="hist-top"):
+            with Vertical(id="hist-trend"):
+                yield Static("SCORE TREND · oldest → newest", classes="caption")
+                yield Sparkline([0], id="hist-spark", min_color=PAL.red, max_color=PAL.green)
+            yield Static(id="hist-summary")
+        yield DataTable(id="hist-table", cursor_type="row")
+        yield Static(id="hist-diff")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(TopBar).right = "history"
+        self.populate()
+        self.query_one("#hist-table").focus()
+
+    def populate(self) -> None:
+        self.runs = load_runs()
+        scores = [r.score for r in reversed(self.runs)]
+        self.query_one(Sparkline).data = scores or [0]
+        summary = Text()
+        if self.runs:
+            best = max(self.runs, key=lambda r: r.score)
+            summary.append("Latest  ", PAL.muted).append(f"{self.runs[0].score} {self.runs[0].grade}\n", f"bold {grade_color(self.runs[0].grade)}")
+            summary.append("Best    ", PAL.muted).append(f"{best.score} {best.grade}", f"bold {grade_color(best.grade)}")
+            summary.append(f"  {best.started:%-d %b}\n", PAL.muted)
+            summary.append("Scans   ", PAL.muted).append(f"{len(self.runs)} kept (max {KEEP_RUNS})")
+        self.query_one("#hist-summary", Static).update(summary)
+
+        t = self.query_one(DataTable)
+        t.clear(columns=True)
+        for label, w in (("When", 18), ("", 9), ("Mode", 6), ("Score", 7), ("Fail", 5), ("Warn", 5), ("Change vs previous", 24)):
+            t.add_column(label, width=w)
+        for i, r in enumerate(self.runs):
+            prev = self.runs[i + 1] if i + 1 < len(self.runs) else None
+            change = Text("first scan", style=PAL.muted)
+            if prev:
+                new, fixed = len(r.issue_keys - prev.issue_keys), len(prev.issue_keys - r.issue_keys)
+                change = Text()
+                change.append(f"+{new} new", PAL.red if new else PAL.muted).append("  ")
+                change.append(f"−{fixed} resolved", PAL.green if fixed else PAL.muted)
+            t.add_row(
+                f"{r.started:%a %-d %b %H:%M}",
+                Text(ago(r.started), style=PAL.muted),
+                r.mode,
+                Text(f"{r.score:>3} {r.grade}", style=f"bold {grade_color(r.grade)}"),
+                Text(str(r.counts["fail"]), style=PAL.red if r.counts["fail"] else PAL.muted),
+                Text(str(r.counts["warn"]), style=PAL.yellow if r.counts["warn"] else PAL.muted),
+                change,
+                key=str(r.path),
+            )
+        if not self.runs:
+            self.query_one("#hist-diff", Static).update(Text("No scans yet.", style=PAL.muted))
+
+    @on(DataTable.RowHighlighted)
+    def highlighted(self, event: DataTable.RowHighlighted) -> None:
+        i = event.cursor_row
+        if not (0 <= i < len(self.runs)):
+            return
+        r = self.runs[i]
+        prev = self.runs[i + 1] if i + 1 < len(self.runs) else None
+        out = Text()
+        if not prev:
+            out.append("First scan on record; nothing to compare against.", PAL.muted)
+        else:
+            new = sorted(r.issue_keys - prev.issue_keys, key=lambda k: SEV_ORDER[k[0]])
+            fixed = sorted(prev.issue_keys - r.issue_keys, key=lambda k: SEV_ORDER[k[0]])
+            out.append(f"Compared with {prev.started:%a %-d %b %H:%M} ({prev.mode} scan)\n", PAL.muted)
+            out.append("New      ", "bold")
+            out.append("none\n" if not new else "\n", PAL.muted)
+            for sev, sec, msg in new[:6]:
+                out.append("  ").append_text(sev_badge(sev)).append(f"  {sec}: ", PAL.muted).append(msg.rstrip(":") + "\n")
+            out.append("Resolved ", "bold")
+            out.append("none\n" if not fixed else "\n", PAL.muted)
+            for sev, sec, msg in fixed[:6]:
+                out.append("  ✓ ", PAL.green).append(f"{sec}: ", PAL.muted).append(msg.rstrip(":") + "\n")
+            if prev.mode != r.mode:
+                out.append("Different scan modes: some differences come from coverage, not changes.", f"italic {PAL.muted}")
+        self.query_one("#hist-diff", Static).update(out)
+
+    @on(DataTable.RowSelected)
+    def selected(self, event: DataTable.RowSelected) -> None:
+        self.dismiss(Path(event.row_key.value))
+
+    def action_open(self) -> None:
+        t = self.query_one(DataTable)
+        if self.runs:
+            self.dismiss(self.runs[t.cursor_row].path)
+
+    def action_back(self) -> None:
+        self.dismiss(None)
+
+    def action_delete(self) -> None:
+        if not self.runs:
+            return
+        r = self.runs[self.query_one(DataTable).cursor_row]
+
+        def done(ok: bool | None) -> None:
+            if ok:
+                shutil.rmtree(r.path, ignore_errors=True)
+                self.populate()
+                self.notify("Scan deleted")
+
+        self.app.push_screen(
+            ConfirmScreen(f"Delete the {r.mode} scan from {r.started:%a %-d %b %H:%M}?", ok="Delete", danger=True), done
+        )
+
+
+class LogScreen(Screen[None]):
+    BINDINGS = [Binding("escape,q", "app.pop_screen", "Back")]
+
+    def __init__(self, run: Run):
+        super().__init__()
+        self.run_ = run
+
+    def compose(self) -> ComposeResult:
+        yield TopBar()
+        yield Log(id="log", highlight=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(TopBar).right = f"full output · {self.run_.started:%a %-d %b %H:%M}"
+        try:
+            text = (self.run_.path / "output.txt").read_text()
+        except OSError:
+            text = "(no output saved for this scan)"
+        log = self.query_one(Log)
+        log.write_lines(re.sub(r"\x1b\[[0-9;]*m", "", text).splitlines())
+        log.scroll_home(animate=False)
+        log.focus()
+
+
+# ---------------------------------------------------------------------------
+# Main app
+
+
+class AuditApp(App[None]):
+    TITLE = "Security Audit"
+    CSS = """
+    Screen { background: $background; }
+    .caption { color: $text-muted; text-style: bold; height: 1; }
+    .hidden { display: none; }
+    .code { background: $boost; color: $primary; padding: 0 1; }
+
+    #empty { height: 1fr; align: center middle; }
+    #welcome { width: 80; height: auto; border: round $primary; padding: 1 3; }
+    #welcome-buttons { height: 3; margin-top: 1; align: center middle; }
+    #welcome-buttons Button { margin: 0 1; }
+
+    #overview { height: 6; padding: 1 2 0 2; }
+    #scorebox { width: 20; height: 5; }
+    #score { width: auto; }
+    #grade { height: 1; margin-top: 1; }
+    #scorebox.good #score, #scorebox.good #grade { color: $success; }
+    #scorebox.mid #score, #scorebox.mid #grade { color: $warning; }
+    #scorebox.bad #score, #scorebox.bad #grade { color: $error; }
+    #stats { width: 1fr; height: 5; padding: 0 2; }
+    #trendbox { width: 36; height: 5; }
+    #trend { height: 2; margin: 1 0 0 0; }
+    #trend-caption { margin-top: 1; }
+    #overview.narrow #trendbox { display: none; }
+
+    #body { height: 1fr; border-top: solid $panel; }
+    #sidebar { width: 32; border-right: solid $panel; padding: 1 1 0 1; }
+    #body.narrow #sidebar { width: 26; }
+    #body.narrow #search { width: 22; }
+    #sections { background: transparent; height: 1fr; margin-top: 1; }
+    #tips { height: auto; color: $text-muted; border-top: solid $panel; padding: 1 1 0 1; }
+    #body.narrow #tips { display: none; }
+    #sections > ListItem { padding: 0 1; }
+    #sections Static { text-wrap: nowrap; text-overflow: ellipsis; }
+    #center { width: 1fr; }
+    #filterbar { height: 3; padding: 0 1; }
+    #sevtabs { width: 1fr; margin-top: 1; }
+    #search { width: 36; }
+    #selbar { height: 1; background: $primary 25%; color: $text; padding: 0 1; display: none; }
+    #selbar.show { display: block; }
+    #split { height: 1fr; layout: vertical; }
+    #table { height: 3fr; background: transparent; }
+    #detail { height: 2fr; min-height: 9; max-height: 18; border-top: solid $panel; padding: 0 2; }
+    #body.wide #split { layout: horizontal; }
+    #body.wide #table { width: 3fr; height: 1fr; }
+    #body.wide #detail { height: 1fr; max-height: 100%; width: 2fr; border-top: none; border-left: solid $panel; }
+    #d-title { margin-top: 1; }
+    #d-meta { color: $text-muted; }
+    #d-detail { margin-bottom: 1; }
+    #d-fix { border: round $panel; background: $boost; margin-bottom: 1; }
+    #d-hint { text-style: italic; margin-bottom: 1; }
+    #d-actions { height: 1; margin: 1 0; }
+    #d-actions Button { margin-right: 2; min-width: 14; padding: 0 1; background: $panel-lighten-2; }
+    #d-actions Button.-primary { background: $primary; }
+
+    #scanbox { width: 80; height: auto; margin-top: 1; }
+    #scan-title { margin-bottom: 1; }
+    #scan-progress { width: 100%; }
+    #scan-progress Bar { width: 1fr; }
+    #scan-elapsed { margin-bottom: 1; }
+    #checklist { height: auto; margin-bottom: 1; }
+    .check { height: 1; }
+    #scan-log { height: 9; border: round $panel; background: transparent; }
+
+    ConfirmScreen, ScanChooser { align: center middle; background: $background 60%; }
+    #dialog { width: 84; height: auto; border: round $primary; padding: 1 2; background: $surface; }
+    .dialog-title { text-style: bold; margin-bottom: 1; }
+    .dialog-note { color: $text-muted; margin-top: 1; }
+    #dialog-code { height: auto; max-height: 16; }
+    #dialog-buttons { height: 3; margin-top: 1; align-horizontal: right; }
+    #dialog-buttons Button { margin-left: 1; }
+    #chooser-list { height: auto; border: none; background: transparent; }
+    #chooser-list > .option-list--option { padding: 0 1; }
+
+    #hist-top { height: 6; padding: 1 2 0 2; }
+    #hist-trend { width: 1fr; }
+    #hist-spark { height: 3; margin-top: 1; }
+    #hist-summary { width: 42; padding-left: 3; }
+    #hist-table { height: 1fr; margin: 1 1 0 1; }
+    #hist-diff { height: auto; max-height: 16; border-top: solid $panel; padding: 1 2; }
+    #log { height: 1fr; margin: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("s", "scan", "Scan"),
+        Binding("x", "run_fix", "Fix"),
+        Binding("space", "toggle_mark", "Select"),
+        Binding("a", "accept", "Accept risk"),
+        Binding("slash", "focus_search", "Search"),
+        Binding("h", "history", "History"),
+        Binding("r", "rescan", "Rescan", show=False),
+        Binding("asterisk", "mark_all", "Select all fixable", show=False),
+        Binding("c", "copy", "Copy fix", show=False),
+        Binding("o", "output", "Full output", show=False),
+        Binding("e", "export", "Export report", show=False),
+        Binding("1", "tab('issues')", "Issues tab", show=False),
+        Binding("2", "tab('accepted')", "Accepted tab", show=False),
+        Binding("3", "tab('notes')", "Notes tab", show=False),
+        Binding("4", "tab('passed')", "Passed tab", show=False),
+        Binding("5", "tab('all')", "All tab", show=False),
+        Binding("escape", "clear_search", "Clear selection/search", show=False),
+        Binding("question_mark", "show_help_panel", "Keys"),
+        Binding("q", "quit", "Quit"),
+    ]
+
+    MAIN_ONLY = {
+        "scan", "rescan", "run_fix", "copy", "focus_search", "history", "output", "export", "tab",
+        "clear_search", "toggle_mark", "mark_all", "accept",
+    }
+
+    def __init__(self, start_scan: str | None = None):
+        super().__init__()
+        self.start_scan_mode = start_scan
+        self.runs: list[Run] = []
+        self.current: Run | None = None
+        self.selected: Finding | None = None
+        self.tab = "issues"
+        self.section: str | None = None
+        self.search_text = ""
+        self.marked: set[int] = set()
+        self.sections_order = engine_sections()
+
+    # -- layout ----------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield TopBar()
+        with Container(id="empty", classes="hidden"):
+            with Vertical(id="welcome"):
+                yield Static(
+                    Text.assemble(
+                        ("No scans yet\n\n", "bold"),
+                        "Security Audit checks packages, boot and disk encryption, kernel hardening, "
+                        "firewall, network exposure, SSH, accounts, permissions, persistence, "
+                        "containers, secrets in your home folder and rootkit indicators.\n\n",
+                        ("Everything is read-only. A full scan uses sudo only to read root-owned files.", PAL.muted),
+                    )
+                )
+                with Horizontal(id="welcome-buttons"):
+                    yield Button("Full scan", id="btn-full", variant="primary")
+                    yield Button("Quick scan", id="btn-quick")
+                    yield Button("Deep scan", id="btn-deep")
+        with Horizontal(id="overview"):
+            with Vertical(id="scorebox"):
+                yield Digits("--", id="score")
+                yield Static(id="grade")
+            yield Static(id="stats")
+            with Vertical(id="trendbox"):
+                yield Static("SCORE TREND", classes="caption")
+                yield Sparkline([0], id="trend", min_color=PAL.red, max_color=PAL.green)
+                yield Static(id="trend-caption")
+        with Horizontal(id="body"):
+            with Vertical(id="sidebar"):
+                yield Static("SECTIONS", classes="caption")
+                yield ListView(id="sections")
+                yield Static(self.tips_text(), id="tips")
+            with Vertical(id="center"):
+                with Horizontal(id="filterbar"):
+                    yield Tabs(
+                        Tab("Issues", id="issues"), Tab("Accepted", id="accepted"), Tab("Notes", id="notes"),
+                        Tab("Passed", id="passed"), Tab("All", id="all"), id="sevtabs",
+                    )
+                    yield Input(placeholder="Search findings…  /", id="search")
+                yield Static(id="selbar")
+                with Container(id="split"):
+                    yield DataTable(id="table", cursor_type="row")
+                    with VerticalScroll(id="detail"):
+                        yield Static(id="d-title")
+                        yield Static(id="d-meta")
+                        with Horizontal(id="d-actions"):
+                            yield Button("Run fix  x", id="btn-runfix", variant="primary", compact=True)
+                            yield Button("Copy  c", id="btn-copy", compact=True)
+                            yield Button("Accept risk  a", id="btn-accept", compact=True)
+                        yield Static("DETAILS", id="d-detail-cap", classes="caption")
+                        yield Static(id="d-detail")
+                        yield Static("SUGGESTED FIX", id="d-fix-cap", classes="caption")
+                        yield Static(id="d-fix", classes="code")
+                        yield Static("HOW TO ADDRESS", id="d-hint-cap", classes="caption")
+                        yield Static(id="d-hint")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        self.register_theme(
+            Theme(
+                name="omarchy", primary=PAL.accent, secondary=PAL.accent2, accent=PAL.accent,
+                warning=PAL.yellow, error=PAL.red, success=PAL.green,
+                foreground=PAL.fg, background=PAL.bg, panel=PAL.panel, dark=PAL.dark,
+            )
+        )
+        self.theme = "omarchy"
+        if not ENGINE.is_file():
+            self.notify(f"secaudit engine not found at {ENGINE}", severity="error", timeout=30)
+        self.runs = load_runs()
+        if self.runs:
+            await self.show_run(self.runs[0])
+        else:
+            self.show_empty()
+        self.apply_layout()
+        if self.start_scan_mode:
+            self.call_after_refresh(self.start_scan, self.start_scan_mode)
+
+    def on_resize(self) -> None:
+        self.apply_layout()
+        if self.current:
+            self.call_after_refresh(self.refresh_table)
+
+    def apply_layout(self) -> None:
+        w = self.size.width
+        self.query_one("#body").set_class(w >= WIDE, "wide")
+        self.query_one("#body").set_class(w < NARROW, "narrow")
+        self.query_one("#overview").set_class(w < NARROW, "narrow")
+
+    def show_empty(self) -> None:
+        self.current = None
+        self.query_one("#empty").remove_class("hidden")
+        for wid in ("#overview", "#body"):
+            self.query_one(wid).add_class("hidden")
+        self.query_one(TopBar).right = ""
+        self.query_one("#btn-full").focus()
+        self.refresh_bindings()
+
+    # -- rendering a run -------------------------------------------------
+
+    def previous_of(self, run: Run) -> Run | None:
+        paths = [r.path for r in self.runs]
+        i = paths.index(run.path) if run.path in paths else -1
+        return self.runs[i + 1] if 0 <= i < len(self.runs) - 1 else None
+
+    async def show_run(self, run: Run) -> None:
+        if not self.current or self.current.path != run.path:
+            self.marked.clear()
+        self.current = run
+        self.query_one("#empty").add_class("hidden")
+        for wid in ("#overview", "#body"):
+            self.query_one(wid).remove_class("hidden")
+
+        latest = self.runs and self.runs[0].path == run.path
+        when = f"{run.started:%a %-d %b %H:%M} · {run.mode} scan · {ago(run.started)}"
+        self.query_one(TopBar).right = when if latest else f"{when}  (older scan, h for history)"
+
+        box = self.query_one("#scorebox")
+        for cls in ("good", "mid", "bad"):
+            box.remove_class(cls)
+        box.add_class(grade_class(run.grade))
+        self.query_one("#score", Digits).update(str(run.score))
+        self.query_one("#grade", Static).update(self.meter_text(run))
+
+        self.query_one("#stats", Static).update(self.stats_text(run))
+
+        chron = [r for r in reversed(self.runs) if r.started <= run.started] or [run]
+        spark = self.query_one("#trend", Sparkline)
+        spark.display = len(chron) >= 4
+        spark.data = [r.score for r in chron]
+        caption = Text()
+        if len(chron) < 4:
+            # Too few points for a meaningful sparkline: show the recent scores instead
+            for i, r in enumerate(chron):
+                if i:
+                    caption.append(" → ", PAL.muted)
+                caption.append(str(r.score), f"bold {grade_color(r.grade)}")
+            caption.append("\n")
+        caption.append(f"{len(chron)} scan{'s' if len(chron) != 1 else ''} · {chron[0].started:%-d %b} → {run.started:%-d %b}", PAL.muted)
+        self.query_one("#trend-caption", Static).update(caption)
+
+        c = run.counts
+        self.query_one("#issues", Tab).label = f"Issues {c['fail'] + c['warn']}"
+        self.query_one("#accepted", Tab).label = f"Accepted {c['accepted']}"
+        self.query_one("#notes", Tab).label = f"Notes {c['info'] + c['skip']}"
+        self.query_one("#passed", Tab).label = f"Passed {c['pass']}"
+        self.query_one("#all", Tab).label = f"All {len(run.findings)}"
+
+        await self.populate_sections()
+        self.refresh_table()
+        self.query_one("#table").focus()
+
+    @staticmethod
+    def meter_text(run: Run, width: int = 12) -> Text:
+        filled = round(width * run.score / 100)
+        col = grade_color(run.grade)
+        return Text.assemble(
+            ("━" * filled, col), ("─" * (width - filled), PAL.muted), ("  "), (run.grade, f"bold {col}")
+        )
+
+    @staticmethod
+    def tips_text() -> Text:
+        t = Text()
+        for key, what in (("space", "select"), ("x", "fix selected"), ("*", "select all fixable"),
+                          ("a", "accept risk"), ("r", "rescan"), ("e", "export report")):
+            t.append(f"{key:>5} ", f"bold {PAL.accent}").append(f"{what}\n", PAL.muted)
+        t.rstrip()
+        return t
+
+    def stats_text(self, run: Run) -> Text:
+        c = run.counts
+        t = Text()
+        for sev, n in (("fail", c["fail"]), ("warn", c["warn"]), ("pass", c["pass"])):
+            icon, label, _ = SEV[sev]
+            style = f"bold {sev_color(sev)} on {PAL.panel}" if n else f"{PAL.muted} on {PAL.panel}"
+            t.append(f" {icon} {n} {label.lower()} ", style).append("  ")
+        if c["accepted"]:
+            t.append(f" ≈ {c['accepted']} accepted ", f"{PAL.muted} on {PAL.panel}")
+        t.append("\n")
+
+        meta = f"{run.mode.capitalize()} scan of {run.meta.get('host', HOST)}"
+        if run.duration is not None:
+            meta += f" · took {mmss(run.duration)}"
+        meta += f" · {c['info']} notes · {c['skip']} skipped"
+        t.append(meta + "\n", PAL.muted)
+
+        prev = self.previous_of(run)
+        if prev:
+            new, fixed = len(run.issue_keys - prev.issue_keys), len(prev.issue_keys - run.issue_keys)
+            t.append("Since previous scan" + ("" if prev.mode == run.mode else f" ({prev.mode})") + ": ", PAL.muted)
+            t.append(f"{new} new", f"bold {PAL.red}" if new else PAL.muted).append(" · ", PAL.muted)
+            t.append(f"{fixed} resolved", f"bold {PAL.green}" if fixed else PAL.muted)
+            delta = run.score - prev.score
+            if delta:
+                t.append(f" · score {'+' if delta > 0 else ''}{delta}", PAL.green if delta > 0 else PAL.red)
+            t.append("\n")
+        else:
+            t.append("First scan on record\n", PAL.muted)
+
+        if run.mode == "quick":
+            t.append("Root-only checks skipped. Press ", f"italic {PAL.muted}")
+            t.append("s", f"bold {PAL.accent}").append(" for a full scan.", f"italic {PAL.muted}")
+        else:
+            unfixed = [f for f in run.findings if f.is_issue and not f.accepted and f.fix and f.n not in run.applied]
+            if unfixed:
+                t.append(f"{len(unfixed)} issue{'s' if len(unfixed) != 1 else ''} can be fixed automatically. Press ", f"italic {PAL.muted}")
+                t.append("*", f"bold {PAL.accent}").append(" then ", f"italic {PAL.muted}")
+                t.append("x", f"bold {PAL.accent}").append(" to fix them together.", f"italic {PAL.muted}")
+        return t
+
+    async def populate_sections(self) -> None:
+        run = self.current
+        assert run
+        lv = self.query_one("#sections", ListView)
+        await lv.clear()
+        # sidebar width - border - padding - item padding - scrollbar - icon - count
+        width = (26 if self.size.width < NARROW else 32) - 1 - 2 - 2 - 1 - 2 - 3
+        items = []
+        total = run.counts["fail"] + run.counts["warn"]
+        items.append(SectionItem(None, Text.assemble(("◆ ", PAL.accent), (f"{'All sections':<{width}}", "bold"), (f"{total:>3}", PAL.muted))))
+        present = {f.section for f in run.findings}
+        order = [s for s in self.sections_order if s in present] + sorted(present - set(self.sections_order))
+        for sec in order:
+            fails = sum(1 for f in run.findings if f.section == sec and f.sev == "fail" and not f.accepted)
+            warns = sum(1 for f in run.findings if f.section == sec and f.sev == "warn" and not f.accepted)
+            if fails:
+                icon, col = "✗", PAL.red
+            elif warns:
+                icon, col = "!", PAL.yellow
+            else:
+                icon, col = "✓", PAL.green
+            name = clip(sec, width)
+            name.pad_right(width - name.cell_len)
+            label = Text.assemble((f"{icon} ", f"bold {col}"), name, (f"{fails + warns:>3}" if fails + warns else "   ", col))
+            items.append(SectionItem(sec, label))
+        await lv.extend(items)
+        names = [None] + order
+        if self.section not in names:
+            self.section = None
+        lv.index = names.index(self.section)
+
+    def visible(self) -> list[Finding]:
+        if not self.current:
+            return []
+        q = self.search_text.lower()
+        rows = [
+            f for f in self.current.findings
+            if in_tab(f, self.tab)
+            and (self.section is None or f.section == self.section)
+            and (not q or q in f"{f.msg}\n{f.section}\n{f.detail}\n{f.fix}\n{f.hint}".lower())
+        ]
+        return sorted(rows, key=lambda f: (SEV_ORDER.get(f.sev, 9), f.n))
+
+    def refresh_table(self) -> None:
+        if not self.current:
+            return
+        t = self.query_one("#table", DataTable)
+        keep = self.selected.n if self.selected else None
+        prev_row = t.cursor_row
+        t.clear(columns=True)
+        avail = max(t.size.width, 60)
+        sec_w = 0 if self.section else 22
+        ncols = 5 if sec_w else 4
+        msg_w = max(24, avail - 1 - 7 - sec_w - 8 - ncols * 2 - 2)
+        t.add_column("", key="mark", width=1)
+        t.add_column("", key="sev", width=7)
+        if sec_w:
+            t.add_column("Section", key="sec", width=sec_w)
+        t.add_column("Finding", key="msg", width=msg_w)
+        t.add_column("Fix", key="fix", width=8)
+
+        applied = self.current.applied
+        rows = self.visible()
+        for f in rows:
+            if f.accepted:
+                fix = Text("accepted", style=PAL.muted)
+            elif f.n in applied:
+                fix = Text("✓ done", style=PAL.green)
+            elif f.fix:
+                fix = Text("● fix", style=PAL.accent)
+            elif f.hint and f.is_issue:
+                fix = Text("advice", style=PAL.muted)
+            else:
+                fix = Text("")
+            mark = Text("◉", style=f"bold {PAL.accent}") if f.n in self.marked else Text("")
+            badge = sev_badge(f.sev)
+            if f.accepted:
+                badge.stylize(f"dim {PAL.muted}")
+            cells = [mark, badge]
+            if sec_w:
+                sec_text = clip(f.section, sec_w)
+                sec_text.stylize(PAL.muted)
+                cells.append(sec_text)
+            title = clip(f.title, msg_w)
+            if f.accepted:
+                title.stylize(PAL.muted)
+            cells += [title, fix]
+            t.add_row(*cells, key=str(f.n))
+
+        self.update_selbar()
+        if not rows:
+            self.show_detail(None)
+            return
+        # Stay on the same finding; if it left this view, stay at the same position
+        idx = next((i for i, f in enumerate(rows) if f.n == keep), min(prev_row, len(rows) - 1))
+        t.move_cursor(row=idx, animate=False)
+        self.show_detail(rows[idx])
+
+    def show_detail(self, f: Finding | None) -> None:
+        self.selected = f
+        q = self.query_one
+        for wid in ("#d-detail-cap", "#d-detail", "#d-fix-cap", "#d-fix", "#d-hint-cap", "#d-hint", "#d-actions"):
+            q(wid).display = False
+        if f is None:
+            if self.tab == "accepted" and not self.search_text:
+                msg = Text("No accepted risks", style="bold")
+                sub = "Press a on an issue you've decided to live with; it stops counting against your score."
+            elif self.tab == "issues" and not self.search_text:
+                msg = Text.assemble(("✓ No issues here", f"bold {PAL.green}"))
+                sub = "Nothing to fix in this view."
+            else:
+                msg = Text("No matching findings", style="bold")
+                sub = "Try another tab, section, or search."
+            q("#d-title", Static).update(msg)
+            q("#d-meta", Static).update(sub)
+            self.refresh_bindings()
+            return
+
+        title = Text.assemble(sev_badge(f.sev), "  ", (f.title, "bold"))
+        q("#d-title", Static).update(title)
+        meta = Text(f.section, style=PAL.muted)
+        if f.accepted:
+            when = ACCEPTED.get(f.accept_key, {}).get("at")
+            meta.append("  ·  ", PAL.muted).append(
+                "accepted risk" + (f" since {datetime.fromtimestamp(when):%-d %b}" if when else "") + ", not scored",
+                f"italic {PAL.muted}",
+            )
+        elif self.current and f.n in self.current.applied:
+            meta.append("  ·  ", PAL.muted).append("✓ fix applied, rescan (r) to verify", PAL.green)
+        q("#d-meta", Static).update(meta)
+
+        if f.detail:
+            q("#d-detail-cap").display = q("#d-detail").display = True
+            q("#d-detail", Static).update(Text(f.detail))
+        if f.fix:
+            q("#d-fix-cap").display = q("#d-fix").display = True
+            q("#d-fix", Static).update(Text(f.fix))
+        if f.hint:
+            q("#d-hint-cap").display = q("#d-hint").display = True
+            q("#d-hint", Static).update(Text(f.hint))
+        if f.fix or f.hint or f.is_issue:
+            q("#d-actions").display = True
+            q("#btn-runfix", Button).display = bool(f.fix) and not f.accepted
+            q("#btn-copy", Button).display = bool(f.fix or f.hint)
+            q("#btn-copy", Button).label = "Copy fix  c" if f.fix else "Copy advice  c"
+            accept = q("#btn-accept", Button)
+            accept.display = f.is_issue
+            accept.label = "Un-accept  a" if f.accepted else "Accept risk  a"
+        if f.sev == "pass" and not f.detail:
+            q("#d-meta", Static).update(Text.assemble(meta, ("\nThis check passed.", PAL.muted)))
+        self.query_one("#detail", VerticalScroll).scroll_home(animate=False)
+        self.refresh_bindings()
+
+    # -- events ----------------------------------------------------------
+
+    @on(DataTable.RowHighlighted, "#table")
+    def row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self.current and event.row_key.value:
+            n = int(event.row_key.value)
+            self.show_detail(next((f for f in self.current.findings if f.n == n), None))
+
+    @on(DataTable.RowSelected, "#table")
+    def row_selected(self) -> None:
+        if self.selected and self.selected.fix:
+            self.action_run_fix()
+        else:
+            self.query_one("#detail").focus()
+
+    @on(ListView.Highlighted, "#sections")
+    def section_highlighted(self, event: ListView.Highlighted) -> None:
+        if isinstance(event.item, SectionItem) and event.item.section != self.section:
+            self.section = event.item.section
+            self.refresh_table()
+
+    @on(ListView.Selected, "#sections")
+    def section_selected(self) -> None:
+        self.query_one("#table").focus()
+
+    @on(Tabs.TabActivated, "#sevtabs")
+    def tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tab.id and event.tab.id != self.tab:
+            self.tab = event.tab.id
+            self.refresh_table()
+
+    @on(Input.Changed, "#search")
+    def search_changed(self, event: Input.Changed) -> None:
+        self.search_text = event.value.strip()
+        self.refresh_table()
+
+    @on(Input.Submitted, "#search")
+    def search_submitted(self) -> None:
+        self.query_one("#table").focus()
+
+    @on(Button.Pressed)
+    def button(self, event: Button.Pressed) -> None:
+        match event.button.id:
+            case "btn-full" | "btn-quick" | "btn-deep":
+                self.start_scan(event.button.id.removeprefix("btn-"))
+            case "btn-runfix":
+                self.action_run_fix()
+            case "btn-copy":
+                self.action_copy()
+            case "btn-accept":
+                self.run_worker(self.action_accept())
+
+    # -- actions ---------------------------------------------------------
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action in self.MAIN_ONLY and len(self.screen_stack) > 1:
+            return False
+        if action == "quit" and self.current is None and len(self.screen_stack) == 1:
+            return True
+        if action == "run_fix":
+            return True if self.marked or (self.selected and self.selected.fix and not self.selected.accepted) else None
+        if action == "accept":
+            return True if self.selected and self.selected.is_issue else None
+        if action in ("toggle_mark", "mark_all"):
+            return True if self.current and self.tab != "accepted" else None
+        if action == "copy":
+            return True if self.selected and (self.selected.fix or self.selected.hint) else None
+        if action in ("rescan", "output", "export", "focus_search", "tab", "clear_search"):
+            return True if self.current else None
+        if action == "history":
+            return True if self.runs else None
+        return True
+
+    def get_system_commands(self, screen: Screen):
+        yield from super().get_system_commands(screen)
+        yield SystemCommand("Full scan", "Run every check with sudo", lambda: self.start_scan("full"))
+        yield SystemCommand("Quick scan", "User-level checks without sudo", lambda: self.start_scan("quick"))
+        yield SystemCommand("Deep scan", "Full scan plus package integrity and whole-disk SUID", lambda: self.start_scan("deep"))
+        if self.runs:
+            yield SystemCommand("Scan history", "Past scans, trend and changes", self.action_history)
+        if self.current:
+            yield SystemCommand("Export Markdown report", "Checklist of issues with fixes", self.action_export)
+            yield SystemCommand("Full output", "Raw text output of this scan", self.action_output)
+
+    def action_scan(self) -> None:
+        self.push_screen(ScanChooser(), lambda mode: mode and self.start_scan(mode))
+
+    def action_rescan(self) -> None:
+        self.start_scan(self.current.mode if self.current else "full")
+
+    def start_scan(self, mode: str) -> None:
+        if not ENGINE.is_file():
+            self.notify(f"secaudit engine not found at {ENGINE}", severity="error")
+            return
+        if mode != "quick" and not self.ensure_sudo(mode):
+            self.notify("No sudo access, scan cancelled. Quick scan works without sudo.", severity="warning")
+            return
+        self.push_screen(ScanScreen(mode), self.scan_done)
+
+    def ensure_sudo(self, mode: str) -> bool:
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+            return True
+        with self.suspend():
+            print(f"\n  \033[1mSecurity Audit · {mode} scan\033[0m\n")
+            print("  This scan reads root-only files: shadow, sudoers, firewall rules, LUKS headers.")
+            print("  \033[2mIt never changes anything; sudo is only used to look.\033[0m\n")
+            ok = subprocess.run(["sudo", "-v"]).returncode == 0
+        self.refresh()
+        return ok
+
+    def scan_done(self, path: Path | None) -> None:
+        if path is None:
+            self.notify("Scan cancelled", severity="warning")
+            return
+        self.runs = load_runs()
+        run = next((r for r in self.runs if r.path == path), None)
+        if not run:
+            return
+        self.section = None
+        self.call_later(self.show_run, run)
+        c = run.counts
+        body = f"Score {run.score} ({run.grade}) · {c['fail']} fail · {c['warn']} warn"
+        self.notify(body, title="Scan finished", severity="error" if c["fail"] else "information")
+        if shutil.which("notify-send"):
+            subprocess.Popen(
+                ["notify-send", "-a", "secaudit", "-i", "security-high-symbolic", "Security audit finished", body],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+    def fix_targets(self) -> list[Finding]:
+        run = self.current
+        if not run:
+            return []
+        if self.marked:
+            return [f for f in run.findings if f.n in self.marked]
+        f = self.selected
+        return [f] if f and f.fix and not f.accepted else []
+
+    def action_run_fix(self) -> None:
+        run, targets = self.current, self.fix_targets()
+        if not run or not targets:
+            self.notify("No automatic fix for this finding. See How to address.", severity="warning")
+            return
+        many = len(targets) > 1
+        code = Text()
+        for i, f in enumerate(targets, 1):
+            if many:
+                code.append(f"{i}. {f.title}\n", f"bold {PAL.fg}")
+            code.append(f"$ {f.fix}" + ("\n\n" if many and i < len(targets) else ""), PAL.accent)
+        note = "Runs in this terminal. You'll see the output, then return here."
+        if any("sudo" in f.fix for f in targets):
+            note += " sudo asks for your password once."
+        again = [f for f in targets if f.n in run.applied]
+        if again:
+            note = f"{len(again)} of these {'were' if many else 'was'} already applied in this scan. " + note
+        title = f"Run {len(targets)} fixes?" if many else f"Run this fix?  {targets[0].title}"
+
+        def go(ok: bool | None) -> None:
+            if not ok:
+                return
+            results: list[tuple[Finding, int]] = []
+            with self.suspend():
+                for i, f in enumerate(targets, 1):
+                    step = f"[{i}/{len(targets)}] " if many else ""
+                    print(f"\n  \033[1m{step}{f.title}\033[0m\n  \033[2m$ {f.fix}\033[0m")
+                    rc = subprocess.run(["bash", "-c", f.fix]).returncode
+                    print("  \033[32m✓ done\033[0m" if rc == 0 else f"  \033[31m✗ exit status {rc}\033[0m")
+                    results.append((f, rc))
+                ok_n = sum(1 for _, rc in results if rc == 0)
+                print(f"\n  {ok_n} of {len(results)} succeeded.")
+                try:
+                    input("  Press Enter to return to Security Audit… ")
+                except EOFError:
+                    pass
+            for f, rc in results:
+                if rc == 0:
+                    run.mark_applied(f.n)
+                    self.marked.discard(f.n)
+            failed = [f for f, rc in results if rc != 0]
+            if failed:
+                self.notify(f"{len(failed)} fix{'es' if len(failed) != 1 else ''} failed; they stay selected.", severity="error")
+            else:
+                self.notify("Press r to rescan and confirm the issues are gone.", title=f"{len(results)} fix{'es' if many else ''} applied")
+            self.refresh_table()
+            self.query_one("#stats", Static).update(self.stats_text(run))
+
+        self.push_screen(ConfirmScreen(title, code, note, ok=f"Run {len(targets)}" if many else "Run"), go)
+
+    def action_toggle_mark(self) -> None:
+        f = self.selected
+        if not f:
+            return
+        if not f.fix or f.accepted:
+            self.notify("Only findings with an automatic fix can be selected.", severity="warning", timeout=3)
+            return
+        self.marked ^= {f.n}
+        self.refresh_table()
+        self.query_one("#table", DataTable).action_cursor_down()
+
+    def action_mark_all(self) -> None:
+        fixable = {f.n for f in self.visible() if f.fix and not f.accepted and f.n not in (self.current.applied if self.current else set())}
+        if not fixable:
+            self.notify("Nothing in this view has an automatic fix.", severity="warning", timeout=3)
+            return
+        if fixable <= self.marked:
+            self.marked -= fixable
+        else:
+            self.marked |= fixable
+        self.refresh_table()
+
+    def update_selbar(self) -> None:
+        bar = self.query_one("#selbar", Static)
+        if not self.marked:
+            bar.remove_class("show")
+            return
+        n = len(self.marked)
+        bar.update(Text.assemble(
+            ("◉ ", f"bold {PAL.accent}"), (f"{n} selected", "bold"), ("   ", ""),
+            ("x", f"bold {PAL.accent}"), (f" fix {'all ' if n > 1 else ''}{n}   ", ""),
+            ("space", f"bold {PAL.accent}"), (" toggle   ", ""), ("*", f"bold {PAL.accent}"), (" all   ", ""),
+            ("esc", f"bold {PAL.accent}"), (" clear", ""),
+        ))
+        bar.add_class("show")
+
+    async def action_accept(self) -> None:
+        f, run = self.selected, self.current
+        if not f or not run or not f.is_issue:
+            return
+        if f.accepted:
+            ACCEPTED.pop(f.accept_key, None)
+            msg = f"Moved back to Issues: {f.title}"
+        else:
+            ACCEPTED[f.accept_key] = {"section": f.section, "msg": f.title, "at": int(time.time())}
+            self.marked.discard(f.n)
+            msg = f"Accepted, no longer scored: {f.title}"
+        save_accepted(ACCEPTED)
+        for r in self.runs:
+            r.recount()
+        await self.show_run(run)
+        self.notify(msg + "\nPress a again to undo.", timeout=4)
+
+    def action_copy(self) -> None:
+        f = self.selected
+        if not f:
+            return
+        text = f.fix or f.hint
+        if not text:
+            return
+        copy_to_clipboard(self, text)
+        self.notify("Fix command copied" if f.fix else "Advice copied")
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_clear_search(self) -> None:
+        search = self.query_one("#search", Input)
+        if self.marked and not search.has_focus:
+            self.marked.clear()
+            self.refresh_table()
+        elif search.value:
+            search.value = ""
+        self.query_one("#table").focus()
+
+    def action_tab(self, name: str) -> None:
+        self.query_one("#sevtabs", Tabs).active = name
+
+    def action_history(self) -> None:
+        def opened(path: Path | None) -> None:
+            self.runs = load_runs()
+            if path:
+                run = next((r for r in self.runs if r.path == path), None)
+                if run:
+                    self.section = None
+                    self.call_later(self.show_run, run)
+                    return
+            if not self.runs:
+                self.show_empty()
+            elif self.current and not self.current.path.exists():
+                self.call_later(self.show_run, self.runs[0])
+            elif self.current:
+                self.call_later(self.show_run, self.current)
+
+        self.push_screen(HistoryScreen(), opened)
+
+    def action_output(self) -> None:
+        if self.current:
+            self.push_screen(LogScreen(self.current))
+
+    def action_export(self) -> None:
+        if not self.current:
+            return
+        out = export_markdown(self.current)
+        copy_to_clipboard(self, str(out))
+        self.notify(f"{str(out).replace(str(Path.home()), '~')}\nPath copied to clipboard.", title="Report saved", timeout=8)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Security Audit terminal app")
+    parser.add_argument("--scan", choices=["quick", "full", "deep"], help="start a scan immediately")
+    args = parser.parse_args()
+    RUNS.mkdir(parents=True, exist_ok=True)
+    prune_incomplete()
+    AuditApp(start_scan=args.scan).run()
+
+
+if __name__ == "__main__":
+    main()

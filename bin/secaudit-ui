@@ -1,0 +1,558 @@
+#!/bin/bash
+# Interactive front-end for secaudit: run scans, review findings, apply fixes, browse history.
+# Usage: secaudit-ui [--scan quick|full|deep] [--last]
+
+set -o pipefail
+
+ENGINE="${SECAUDIT_ENGINE:-$(dirname "$(readlink -f "$0")")/secaudit}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/secaudit"
+RUNS="$STATE/runs"
+KEEP_RUNS=30
+SEP=$'\x1f' # gum label delimiter; never appears in findings
+
+have() { command -v "$1" >/dev/null 2>&1; }
+have gum && have jq || { echo "secaudit-ui needs gum and jq" >&2; exit 1; }
+[[ -x "$ENGINE" ]] || { echo "secaudit engine not found at $ENGINE" >&2; exit 1; }
+
+# Follow the current Omarchy theme even if the session env is stale
+have omarchy-restart-gum && source omarchy-restart-gum
+
+hex_fg() { # #rrggbb -> truecolor escape, falls back to an ANSI palette index
+  local h=${1#\#}
+  if [[ "$h" =~ ^[0-9a-fA-F]{6}$ ]]; then printf '\e[38;2;%d;%d;%dm' "0x${h:0:2}" "0x${h:2:2}" "0x${h:4:2}"
+  else printf '\e[3%sm' "${2:-4}"; fi
+}
+ACCENT_HEX=${BORDER_FOREGROUND:-#4b8ef4}
+MUTED_HEX=${GUM_INPUT_PLACEHOLDER_FOREGROUND:-#545454}
+A=$(hex_fg "$ACCENT_HEX" 4) M=$(hex_fg "$MUTED_HEX" 8)
+# Severity colors use the terminal palette, which Omarchy themes already tune
+RED=$'\e[31m' YEL=$'\e[33m' GRN=$'\e[32m' BLU=$'\e[34m'
+B=$'\e[1m' I=$'\e[3m' N=$'\e[0m' EL=$'\e[K'
+
+declare -A ICON=([fail]="✗" [warn]="!" [pass]="✓" [info]="i" [skip]="–")
+declare -A COLOR=([fail]="$RED" [warn]="$YEL" [pass]="$GRN" [info]="$BLU" [skip]="$M")
+declare -A LABEL=([fail]="FAIL" [warn]="WARN" [pass]="PASS" [info]="NOTE" [skip]="SKIP")
+
+cols() { tput cols 2>/dev/null || echo 80; }
+width() { local c; c=$(cols); ((c > 96)) && echo 92 || echo $((c - 4)); }
+
+trunc() { # text max
+  local t=$1 m=$2
+  ((${#t} > m)) && printf '%s…' "${t:0:m-1}" || printf '%s' "$t"
+}
+
+cleanup() { tput cnorm 2>/dev/null; }
+trap cleanup EXIT
+
+pause() {
+  printf '\n  %spress any key to continue%s' "$M" "$N"
+  read -rsn1 </dev/tty
+}
+
+choose() { # header, then label<SEP>value lines on stdin
+  gum choose --label-delimiter="$SEP" --header "$1" --height "${2:-12}" \
+    --cursor "  ▸ " --cursor-prefix "" --unselected-prefix "" --selected-prefix ""
+}
+
+title_bar() { # left text, right text
+  local w left=$1 right=$2
+  w=$(width)
+  local pad=$((w - ${#left} - ${#right} - 2))
+  ((pad < 1)) && pad=1
+  printf '\n  %s%s◆ %s%s%*s%s%s%s\n' "$B" "$A" "$left" "$N" "$pad" "" "$M" "$right" "$N"
+  printf '  %s%s%s\n' "$M" "$(printf '─%.0s' $(seq 1 "$w"))" "$N"
+}
+
+# ---------------------------------------------------------------------------
+# Run data helpers. Each run lives in $RUNS/<timestamp>/ with
+# findings.jsonl (engine output), output.txt (text log) and meta.json.
+
+runs_newest_first() { ls -1d "$RUNS"/*/ 2>/dev/null | sed 's#/$##' | sort -r | while read -r d; do [[ -s "$d/findings.jsonl" ]] && echo "$d"; done; }
+
+previous_run() { # run dir -> the completed run before it
+  runs_newest_first | awk -v cur="$1" 'found {print; exit} $0==cur {found=1}'
+}
+
+counts() { # run dir -> "fail warn pass info skip"
+  jq -rs '[ "fail","warn","pass","info","skip" ] as $k | group_by(.sev) | map({key: .[0].sev, value: length}) | from_entries as $c | $k | map($c[.] // 0) | @tsv' \
+    "$1/findings.jsonl" | tr '\t' ' '
+}
+
+score_of() { # fail warn -> 0..100
+  local s=$((100 - 10 * $1 - 2 * $2))
+  ((s < 0)) && s=0
+  echo "$s"
+}
+
+grade_of() {
+  if (($1 >= 90)); then echo A; elif (($1 >= 80)); then echo B; elif (($1 >= 70)); then echo C
+  elif (($1 >= 60)); then echo D; else echo F; fi
+}
+
+grade_color() { case "$1" in A | B) echo "$GRN" ;; C | D) echo "$YEL" ;; *) echo "$RED" ;; esac; }
+
+meta() { jq -r ".$2 // empty" "$1/meta.json" 2>/dev/null; }
+
+when() { # epoch -> "2h ago" style
+  local d=$(($(date +%s) - $1))
+  if ((d < 60)); then echo "just now"; elif ((d < 3600)); then echo "$((d / 60))m ago"
+  elif ((d < 86400)); then echo "$((d / 3600))h ago"; else echo "$((d / 86400))d ago"; fi
+}
+
+mmss() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+run_summary_line() { # run dir -> one-line summary
+  local c f w s g
+  read -r f w _ _ _ <<<"$(counts "$1")"
+  s=$(score_of "$f" "$w"); g=$(grade_of "$s")
+  printf '%s%s %s%s  %s  %s%d fail%s  %s%d warn%s  %s· %s scan · %s%s' \
+    "$(grade_color "$g")$B" "$s" "$g" "$N" "" "$RED" "$f" "$N" "$YEL" "$w" "$N" \
+    "$M" "$(meta "$1" mode)" "$(when "$(meta "$1" started)")" "$N"
+}
+
+# Findings that need attention: key used to compare runs
+issue_keys() { jq -r 'select(.sev=="fail" or .sev=="warn") | "\(.sev)\t\(.section)\t\(.msg)"' "$1/findings.jsonl" | sort -u; }
+
+# ---------------------------------------------------------------------------
+# Scanning
+
+engine_sections() { grep -oP '^section "\K[^"]+' "$ENGINE" | grep -vx Summary; }
+
+render_progress() { # dir mode spin_frame elapsed done
+  local dir=$1 mode=$2 frame=$3 elapsed=$4 done=$5 w
+  w=$(width)
+  mapfile -t secs < <(engine_sections)
+  local total=${#secs[@]}
+
+  # section -> "warn fail" from the live text log
+  declare -A sw sf
+  local current="" n_seen=0
+  while IFS=$'\t' read -r sec wv fv; do
+    sw[$sec]=$wv; sf[$sec]=$fv; current=$sec; ((n_seen++))
+  done < <(awk '
+    /^== .* ==$/ { sec = substr($0, 4, length($0) - 6); if (!(sec in seen)) { order[++n] = sec; seen[sec] = 1 } }
+    /\[WARN\]/ { w[sec]++ }
+    /\[FAIL\]/ { f[sec]++ }
+    END { for (i = 1; i <= n; i++) if (order[i] != "Summary") printf "%s\t%d\t%d\n", order[i], w[order[i]], f[order[i]] }
+  ' "$dir/output.txt" 2>/dev/null)
+
+  local completed=$((done ? total : (n_seen > 0 ? n_seen - 1 : 0)))
+  local who="as $USER"
+  [[ "$mode" != quick ]] && who="as root"
+
+  printf '\e[H'
+  title_bar "Security Audit" "${mode^} scan · $who · $(mmss "$elapsed")"
+  printf '%s\n' "$EL"
+
+  local s icon tag
+  for s in "${secs[@]}"; do
+    tag=""
+    if [[ -n "${sw[$s]+x}" && ( "$s" != "$current" || $done == 1 ) ]]; then
+      if ((sf[$s] > 0)); then icon="$RED✗$N"; tag="$RED${sf[$s]} fail$N"
+      elif ((sw[$s] > 0)); then icon="$YEL!$N"
+      else icon="$GRN✓$N"; fi
+      ((sw[$s] > 0)) && tag+="${tag:+  }$YEL${sw[$s]} warn$N"
+      printf '   %s  %-34s %s%s\n' "$icon" "$s" "$tag" "$EL"
+    elif [[ "$s" == "$current" ]]; then
+      printf '   %s%s%s  %s%-34s%s %s%s\n' "$A" "$frame" "$N" "$B" "$s" "$N" "$M${I}checking…$N" "$EL"
+    else
+      printf '   %s·  %s%s%s\n' "$M" "$s" "$N" "$EL"
+    fi
+  done
+
+  local bw=$((w - 14)) filled
+  filled=$((bw * completed / total))
+  printf '%s\n   %s%s%s%s%s  %s%2d / %d%s%s\n' "$EL" "$A" "$(printf '━%.0s' $(seq 1 $((filled > 0 ? filled : 1))))" "$N" \
+    "$M$(printf '─%.0s' $(seq 1 $((bw - filled > 0 ? bw - filled : 1))))" "$N" "$M" "$completed" "$total" "$N" "$EL"
+  ((done)) || printf '\n   %sctrl+c to cancel%s%s' "$M" "$N" "$EL"
+  printf '\e[J'
+}
+
+scan() { # mode: quick | full | deep
+  local mode=$1 args=() runner=()
+  [[ "$mode" == deep ]] && args+=(--deep)
+
+  clear
+  if [[ "$mode" != quick ]]; then
+    title_bar "Security Audit" "${mode^} scan"
+    printf '\n  %s scan reads root-only files (shadow, sudoers, firewall rules, LUKS headers).\n' "${mode^}"
+    printf '  %sThe audit is read-only; sudo is only used to look.%s\n\n' "$M" "$N"
+    sudo -v || { printf '\n  %sNo sudo access, scan cancelled.%s\n' "$RED" "$N"; pause; return 1; }
+    runner=(sudo -n)
+    clear
+  fi
+
+  local ts dir started
+  ts=$(date +%Y%m%d-%H%M%S); dir="$RUNS/$ts"; started=$(date +%s)
+  mkdir -p "$dir"
+  jq -n --arg mode "$mode" --argjson started "$started" --arg host "$(hostname)" \
+    --arg user "$USER" --arg kernel "$(uname -r)" '{$mode, $started, $host, $user, $kernel}' >"$dir/meta.json"
+
+  "${runner[@]}" "$ENGINE" "${args[@]}" --json "$dir/findings.jsonl" >"$dir/output.txt" 2>&1 &
+  local pid=$! cancelled=0
+  trap 'cancelled=1' INT
+
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0
+  tput civis
+  clear
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((cancelled)); then
+      # The engine may run as root; kill its whole process tree
+      "${runner[@]}" pkill -TERM -f -- "--json $dir/findings.jsonl" 2>/dev/null
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      trap - INT; tput cnorm
+      rm -rf "$dir"
+      printf '\n\n   %sScan cancelled.%s\n' "$YEL" "$N"
+      sleep 1
+      return 1
+    fi
+    render_progress "$dir" "$mode" "${frames[i++ % ${#frames[@]}]}" $(($(date +%s) - started)) 0
+    sleep 0.12
+  done
+  wait "$pid"
+  trap - INT
+
+  local finished
+  finished=$(date +%s)
+  jq --argjson finished "$finished" '. + {$finished}' "$dir/meta.json" >"$dir/meta.tmp" && mv "$dir/meta.tmp" "$dir/meta.json"
+  render_progress "$dir" "$mode" "" $((finished - started)) 1
+  tput cnorm
+
+  if [[ ! -s "$dir/findings.jsonl" ]]; then
+    printf '\n\n   %sThe scan produced no results. Last lines of output:%s\n\n' "$RED" "$N"
+    tail -5 "$dir/output.txt" | sed 's/^/     /'
+    rm -rf "$dir"
+    pause
+    return 1
+  fi
+
+  # Keep the newest runs only
+  runs_newest_first | tail -n +$((KEEP_RUNS + 1)) | xargs -r rm -rf
+
+  if have notify-send; then
+    local f w s
+    read -r f w _ _ _ <<<"$(counts "$dir")"
+    s=$(score_of "$f" "$w")
+    notify-send -a secaudit -i security-high-symbolic "Security audit finished" \
+      "Score $s ($(grade_of "$s")) · $f fail · $w warn" 2>/dev/null &
+  fi
+  sleep 0.6
+  dashboard "$dir"
+}
+
+# ---------------------------------------------------------------------------
+# Results
+
+render_dashboard() { # dir
+  local dir=$1 w f wn p inf sk s g gc prev
+  w=$(width)
+  read -r f wn p inf sk <<<"$(counts "$dir")"
+  s=$(score_of "$f" "$wn"); g=$(grade_of "$s"); gc=$(grade_color "$g")
+
+  clear
+  local started finished mode
+  started=$(meta "$dir" started); finished=$(meta "$dir" finished); mode=$(meta "$dir" mode)
+  title_bar "Security Audit" "$(date -d "@$started" '+%a %-d %b %H:%M') · ${mode} scan"
+
+  # Score line with a bar
+  local bw=$((w - 22)) filled
+  filled=$((bw * s / 100))
+  printf '\n   %s%s%3d%s %s%s%s  ' "$B" "$gc" "$s" "$N" "$B$gc" "$g" "$N"
+  printf '%s%s%s' "$gc" "$(printf '━%.0s' $(seq 1 $((filled > 0 ? filled : 1))))" "$N"
+  printf '%s%s%s   %s/100%s\n' "$M" "$(printf '─%.0s' $(seq 1 $((bw - filled > 0 ? bw - filled : 1))))" "$N" "$M" "$N"
+
+  printf '   %s✗ %d fail%s   %s! %d warn%s   %s✓ %d pass%s   %si %d notes   – %d skipped%s\n' \
+    "$RED" "$f" "$N" "$YEL" "$wn" "$N" "$GRN" "$p" "$N" "$M" "$inf" "$sk" "$N"
+
+  local extra=""
+  [[ -n "$finished" ]] && extra="took $(mmss $((finished - started)))"
+  prev=$(previous_run "$dir")
+  if [[ -n "$prev" ]]; then
+    local new resolved
+    new=$(comm -13 <(issue_keys "$prev") <(issue_keys "$dir") | grep -c .)
+    resolved=$(comm -23 <(issue_keys "$prev") <(issue_keys "$dir") | grep -c .)
+    extra+="${extra:+ · }vs previous: "
+    ((new > 0)) && extra+="$RED$new new$M" || extra+="0 new"
+    extra+=", "
+    ((resolved > 0)) && extra+="$GRN$resolved resolved$M" || extra+="0 resolved"
+  fi
+  [[ "$mode" == quick ]] && extra+="${extra:+ · }some checks need a full scan"
+  printf '   %s%s%s\n\n' "$M" "$extra" "$N"
+
+  # Per-section table
+  printf '   %s%-36s %5s %5s %5s%s\n' "$M" "SECTION" "PASS" "WARN" "FAIL" "$N"
+  jq -rs 'group_by(.section) | map({s: .[0].section,
+      p: map(select(.sev=="pass")) | length,
+      w: map(select(.sev=="warn")) | length,
+      f: map(select(.sev=="fail")) | length}) | .[] | [.s, .p, .w, .f] | @tsv' "$dir/findings.jsonl" >"$dir/.sections"
+  local sec sp sw sf icon
+  while read -r sec; do
+    IFS=$'\t' read -r _ sp sw sf < <(awk -F'\t' -v s="$sec" '$1==s' "$dir/.sections")
+    [[ -z "$sp" ]] && continue
+    if ((sf > 0)); then icon="$RED✗$N"; elif ((sw > 0)); then icon="$YEL!$N"; else icon="$GRN✓$N"; fi
+    printf '   %s %-34s %5s %s%5s%s %s%5s%s\n' "$icon" "$(trunc "$sec" 34)" "$sp" \
+      "$( ((sw > 0)) && echo "$YEL" || echo "$M")" "$sw" "$N" \
+      "$( ((sf > 0)) && echo "$RED" || echo "$M")" "$sf" "$N"
+  done < <(engine_sections)
+  rm -f "$dir/.sections"
+  echo
+}
+
+dashboard() { # dir
+  local dir=$1 f wn p inf sk choice prev
+  while true; do
+    render_dashboard "$dir"
+    read -r f wn p inf sk <<<"$(counts "$dir")"
+    prev=$(previous_run "$dir")
+    choice=$(
+      {
+        (((f + wn) > 0)) && echo "Fix issues  ($((f + wn)))${SEP}issues"
+        ((inf > 0)) && echo "Notes  ($inf)${SEP}notes"
+        echo "Passed checks  ($p)${SEP}passed"
+        [[ -n "$prev" ]] && echo "Changes since previous scan${SEP}diff"
+        echo "Full output${SEP}log"
+        echo "Export Markdown report${SEP}export"
+        echo "Scan again${SEP}rescan"
+        echo "Back${SEP}back"
+      } | choose "" 9
+    ) || return 0
+    case "$choice" in
+      issues) browse "$dir" fail warn ;;
+      notes) browse "$dir" info skip ;;
+      passed) browse "$dir" pass ;;
+      diff) show_diff "$prev" "$dir" ;;
+      log) less -R +g "$dir/output.txt" ;;
+      export) export_md "$dir" ;;
+      rescan) scan "$(meta "$dir" mode)"; return ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+browse() { # dir sev...
+  local dir=$1; shift
+  local sevs; sevs=$(printf '"%s",' "$@"); sevs="[${sevs%,}]"
+  local w choice header
+  w=$(width)
+  while true; do
+    clear
+    case "$1" in
+      fail) header="Issues · fail first · enter for details and fix" ;;
+      info) header="Notes · context worth knowing, not problems" ;;
+      *) header="Passed checks" ;;
+    esac
+    title_bar "Security Audit" "$(meta "$dir" mode) scan"
+    printf '\n'
+    choice=$(
+      jq -r --argjson sevs "$sevs" --arg sep "$SEP" '
+        [., input_line_number] as [$f, $n] | select(.sev as $s | $sevs | index($s))
+        | [ ({fail:0, warn:1, info:2, skip:3, pass:4}[.sev]), $n, .sev, .section, .msg, (.fix != "" ) ] | @tsv' \
+        "$dir/findings.jsonl" | sort -t$'\t' -k1,1n -k2,2n |
+        while IFS=$'\t' read -r _ n sev sec msg hasfix; do
+          local mark="  "
+          grep -qx "$n" "$dir/applied" 2>/dev/null && mark="$GRN✓ $N"
+          printf '%s%s %-4s%s  %s%-22s%s %s%s%s\n' "${COLOR[$sev]}" "${ICON[$sev]}" "${LABEL[$sev]}" "$N" \
+            "$M" "$(trunc "$sec" 22)" "$N" "$mark" "$(trunc "${msg%:}" $((w - 40)))" "$SEP$n"
+        done | { cat; echo "${M}← Back$N${SEP}back"; } |
+        choose "$header" $(($(tput lines) - 8))
+    ) || return 0
+    [[ "$choice" == back ]] && return 0
+    detail_view "$dir" "$choice"
+  done
+}
+
+detail_view() { # dir line_number
+  local dir=$1 n=$2 rec sev sec msg detail fix hint w
+  rec=$(sed -n "${n}p" "$dir/findings.jsonl")
+  sev=$(jq -r .sev <<<"$rec"); sec=$(jq -r .section <<<"$rec"); msg=$(jq -r .msg <<<"$rec")
+  detail=$(jq -r .detail <<<"$rec"); fix=$(jq -r .fix <<<"$rec"); hint=$(jq -r .hint <<<"$rec")
+  w=$(width)
+
+  while true; do
+    clear
+    title_bar "Security Audit" "$sec"
+    printf '\n   %s%s%s %s%s  %s%s%s\n' "$B" "${COLOR[$sev]}" "${ICON[$sev]}" "${LABEL[$sev]}" "$N" "$B" "${msg%:}" "$N"
+
+    if [[ -n "$detail" ]]; then
+      local lines max=$(($(tput lines) - 18))
+      ((max < 4)) && max=4
+      lines=$(wc -l <<<"$detail")
+      printf '\n   %sDetails%s\n' "$M" "$N"
+      head -n "$max" <<<"$detail" | while IFS= read -r l; do printf '     %s\n' "$(trunc "$l" $((w - 6)))"; done
+      ((lines > max)) && printf '     %s… %d more (see Full output)%s\n' "$M" $((lines - max)) "$N"
+    fi
+
+    if [[ -n "$fix" ]]; then
+      printf '\n   %sSuggested fix%s\n' "$M" "$N"
+      if ((${#fix} > w - 6)); then
+        printf '     %s%s%s\n' "$A" "$(trunc "$fix" $((w - 6)))" "$N"
+        printf '     %s(%d chars; copy to see it all)%s\n' "$M" "${#fix}" "$N"
+      else
+        printf '     %s%s%s\n' "$A" "$fix" "$N"
+      fi
+    fi
+    [[ -n "$hint" ]] && printf '\n   %sHow to address%s\n     %s%s%s\n' "$M" "$N" "$I" "$hint" "$N"
+    grep -qx "$n" "$dir/applied" 2>/dev/null && printf '\n   %s✓ Fix applied this session; scan again to verify%s\n' "$GRN" "$N"
+    echo
+
+    local choice
+    choice=$(
+      {
+        [[ -n "$fix" ]] && echo "Run fix${SEP}run" && echo "Copy fix to clipboard${SEP}copy"
+        [[ -z "$fix" && -n "$hint" ]] && echo "Copy advice to clipboard${SEP}copyhint"
+        echo "← Back${SEP}back"
+      } | choose "" 4
+    ) || return 0
+
+    case "$choice" in
+      run) run_fix "$dir" "$n" "$fix" ;;
+      copy) copy_text "$fix" ;;
+      copyhint) copy_text "$hint" ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+copy_text() {
+  if have wl-copy; then
+    printf '%s' "$1" | wl-copy && gum style --foreground 2 "   ✓ Copied" && sleep 0.7
+  else
+    printf '\n   %swl-copy not available%s\n' "$RED" "$N"; pause
+  fi
+}
+
+run_fix() { # dir n cmd
+  local dir=$1 n=$2 cmd=$3
+  clear
+  title_bar "Security Audit" "Run fix"
+  printf '\n   This will run:\n\n'
+  fold -w $(($(width) - 6)) <<<"$cmd" | sed "s/^/     $A/; s/\$/$N/"
+  printf '\n'
+  gum confirm "Run this command now?" --affirmative "Run" --negative "Cancel" --default=false || return 0
+  printf '\n'
+  bash -c "$cmd"
+  local rc=$?
+  if ((rc == 0)); then
+    echo "$n" >>"$dir/applied"
+    printf '\n   %s✓ Done.%s %sRun a new scan to confirm the finding is gone.%s\n' "$GRN" "$N" "$M" "$N"
+  else
+    printf '\n   %s✗ Command exited with status %d%s\n' "$RED" "$rc" "$N"
+  fi
+  pause
+}
+
+show_diff() { # prev cur
+  local prev=$1 cur=$2 new resolved
+  new=$(comm -13 <(issue_keys "$prev") <(issue_keys "$cur"))
+  resolved=$(comm -23 <(issue_keys "$prev") <(issue_keys "$cur"))
+  clear
+  title_bar "Security Audit" "vs scan from $(date -d "@$(meta "$prev" started)" '+%-d %b %H:%M') ($(meta "$prev" mode))"
+  printf '\n   %sNew issues%s\n' "$B" "$N"
+  if [[ -z "$new" ]]; then printf '     %snone%s\n' "$M" "$N"
+  else while IFS=$'\t' read -r sev sec msg; do
+    printf '     %s%s%s %s%s:%s %s\n' "${COLOR[$sev]}" "${ICON[$sev]}" "$N" "$M" "$sec" "$N" "${msg%:}"
+  done <<<"$new"; fi
+  printf '\n   %sResolved%s\n' "$B" "$N"
+  if [[ -z "$resolved" ]]; then printf '     %snone%s\n' "$M" "$N"
+  else while IFS=$'\t' read -r sev sec msg; do
+    printf '     %s✓%s %s%s:%s %s\n' "$GRN" "$N" "$M" "$sec" "$N" "${msg%:}"
+  done <<<"$resolved"; fi
+  if [[ "$(meta "$prev" mode)" != "$(meta "$cur" mode)" ]]; then
+    printf '\n   %sThe scans used different modes, so some differences come from coverage, not changes.%s\n' "$M" "$N"
+  fi
+  pause
+}
+
+export_md() { # dir
+  local dir=$1 out f wn s
+  out="$dir/report.md"
+  read -r f wn _ _ _ <<<"$(counts "$dir")"
+  s=$(score_of "$f" "$wn")
+  {
+    printf '# Security audit: %s\n\n' "$(meta "$dir" host)"
+    printf '%s · %s scan · kernel %s · score **%d (%s)** · %d fail · %d warn\n\n' \
+      "$(date -d "@$(meta "$dir" started)" '+%Y-%m-%d %H:%M')" "$(meta "$dir" mode)" "$(meta "$dir" kernel)" \
+      "$s" "$(grade_of "$s")" "$f" "$wn"
+    jq -rs '
+      map(select(.sev=="fail" or .sev=="warn")) as $issues
+      | ($issues | reduce .[].section as $s ([]; if index([$s]) then . else . + [$s] end))[] as $sec
+      | $issues | map(select(.section == $sec)) | sort_by(.sev != "fail") |
+      "## \($sec)\n\n" + (map(
+        "- [ ] **\(.sev | ascii_upcase)** \(.msg | rtrimstr(":"))" +
+        (if .detail != "" then "\n\n  ```\n" + (.detail | split("\n") | map("  " + .) | join("\n")) + "\n  ```" else "" end) +
+        (if .fix != "" then "\n\n  Fix: `" + .fix + "`" else "" end) +
+        (if .hint != "" then "\n\n  " + .hint else "" end)
+      ) | join("\n\n")) + "\n"' "$dir/findings.jsonl"
+  } >"$out"
+  have wl-copy && printf '%s' "$out" | wl-copy
+  printf '\n   %s✓ Saved%s %s\n   %s(path copied to clipboard)%s\n' "$GRN" "$N" "${out/#$HOME/~}" "$M" "$N"
+  pause
+}
+
+history_view() {
+  local choice d f w s
+  while true; do
+    clear
+    title_bar "Security Audit" "History"
+    printf '\n'
+    choice=$(
+      {
+        runs_newest_first | while read -r d; do
+          read -r f w _ _ _ <<<"$(counts "$d")"
+          s=$(score_of "$f" "$w")
+          printf '%s  %s%-5s%s  %s%3d %s%s   %s%2d fail%s  %s%2d warn%s%s\n' \
+            "$(date -d "@$(meta "$d" started)" '+%a %-d %b %H:%M')" "$M" "$(meta "$d" mode)" "$N" \
+            "$(grade_color "$(grade_of "$s")")" "$s" "$(grade_of "$s")" "$N" "$RED" "$f" "$N" "$YEL" "$w" "$N" "$SEP$d"
+        done
+        echo "${M}← Back$N${SEP}back"
+      } | choose "Past scans · newest first" $(($(tput lines) - 8))
+    ) || return 0
+    [[ "$choice" == back ]] && return 0
+    dashboard "$choice"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Home
+
+home() {
+  local last choice
+  while true; do
+    clear
+    title_bar "Security Audit" "$(hostname) · $USER"
+    printf '   %sRead-only checks for packages, boot, kernel, firewall, network, SSH,\n   accounts, permissions, persistence, containers, secrets and rootkits.%s\n' "$M" "$N"
+    last=$(runs_newest_first | head -1)
+    if [[ -n "$last" ]]; then
+      printf '\n   %sLast scan%s  %s\n' "$M" "$N" "$(run_summary_line "$last")"
+    else
+      printf '\n   %sNo scans yet. Start with a full scan for complete coverage.%s\n' "$M" "$N"
+    fi
+    printf '\n'
+    choice=$(
+      {
+        printf 'Full scan      %ssudo · complete coverage · ~20s%s%sfull\n' "$M" "$N" "$SEP"
+        printf 'Quick scan     %sno sudo · user-level checks · ~15s%s%squick\n' "$M" "$N" "$SEP"
+        printf 'Deep scan      %ssudo · + package integrity, whole-disk SUID · minutes%s%sdeep\n' "$M" "$N" "$SEP"
+        [[ -n "$last" ]] && printf 'Last results%s%s\n' "$SEP" "last"
+        [[ -n "$last" ]] && printf 'History        %s%d scans%s%shistory\n' "$M" "$(runs_newest_first | wc -l)" "$N" "$SEP"
+        printf 'Quit%squit\n' "$SEP"
+      } | choose "" 7
+    ) || exit 0
+    case "$choice" in
+      full | quick | deep) scan "$choice" ;;
+      last) dashboard "$last" ;;
+      history) history_view ;;
+      quit) exit 0 ;;
+    esac
+  done
+}
+
+mkdir -p "$RUNS"
+case "$1" in
+  --scan) [[ "$2" =~ ^(quick|full|deep)$ ]] || { echo "Usage: secaudit-ui --scan quick|full|deep" >&2; exit 2; }
+    scan "$2" ;;
+  --last) last=$(runs_newest_first | head -1); [[ -n "$last" ]] && dashboard "$last" ;;
+  -h | --help) echo "Usage: secaudit-ui [--scan quick|full|deep] [--last]"; exit 0 ;;
+esac
+home
